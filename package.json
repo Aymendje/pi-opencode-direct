@@ -1,0 +1,57 @@
+{
+  "name": "pi-opencode-direct",
+  "version": "0.1.0",
+  "description": "Keyless OpenCode Zen free models for Pi, using native HTTP APIs",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "opencode",
+    "zen"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "check": "tsc --noEmit",
+    "test:live": "node --experimental-strip-types test/live.ts",
+    "check:package": "npm pack --dry-run --ignore-scripts",
+    "verify": "npm run check && npm test && npm run check:package",
+    "prepublishOnly": "npm run verify"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aymendje/pi-opencode-direct.git"
+  },
+  "homepage": "https://github.com/Aymendje/pi-opencode-direct#readme",
+  "bugs": {
+    "url": "https://github.com/Aymendje/pi-opencode-direct/issues"
+  }
+}
