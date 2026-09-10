@@ -11,7 +11,9 @@ Requires Pi 0.85.1 or newer (tested with 0.85.1) and Node 22.19 or newer.
 pi install npm:pi-opencode-direct
 ```
 
-For development, run `pi install .` from a checkout of this repository.
+For development, run `npm ci --ignore-scripts` followed by `pi install .`
+from a checkout of this repository. Install through npm or Pi so that peer
+packages needed by the native transport imports are available.
 
 Restart Pi or use `/reload`, then select **OpenCode Zen Free** in `/model`.
 

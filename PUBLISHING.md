@@ -22,7 +22,9 @@ npm pack --dry-run
 The tarball should contain only `package.json`, `src/index.ts`,
 `src/provider.ts`, `README.md`, `CHANGELOG.md`, and `LICENSE`. Tests, CI,
 node_modules, and local settings are excluded. The Pi packages are peers;
-they are provided by the user's Pi installation.
+npm installs them as peers during package installation. Do not omit peer
+dependencies: the native transport subpath imports need them even though Pi
+also supplies its core extension API.
 
 Commit and push the reviewed release, then authenticate with the npm account
 that will own the package and publish:
