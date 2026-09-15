@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createModels, Type, type Model, type Api, type FetchFunction } from "@earendil-works/pi-ai";
-import { freeModels, zenProvider, PROVIDER_ID, sessionHeader } from "../src/provider.ts";
+import { freeModels, zenProvider, PROVIDER_ID, sessionHeader, isEncryptedContentError, stripStaleReasoning } from "../src/provider.ts";
 
 const muse = (p = zenProvider()) => p.getModels().find(m => m.id === "muse-spark-1.3-contributor-free")!;
 const context = { messages: [{ role: "user" as const, content: "Test", timestamp: 1 }] };
@@ -115,4 +115,59 @@ test("cancellation aborts native requests and errors do not become successful an
   const failed = await p.streamSimple(muse(p), context, { fetch: async () => Response.json({ error: { message: "Rate limit", type: "rate_limit_error" } }, { status: 429 }), maxRetries: 0 }).result();
   assert.equal(failed.stopReason, "error");
   assert.match(failed.errorMessage!, /Rate limit/);
+});
+
+test("encrypted_content rotation is detected", () => {
+  assert.equal(isEncryptedContentError(400, "reasoning `encrypted_content` was not issued to this caller"), true);
+  assert.equal(isEncryptedContentError(400, "The encrypted content gAAA= could not be verified."), true);
+  assert.equal(isEncryptedContentError(400, "Rate limit"), false);
+  assert.equal(isEncryptedContentError(429, "encrypted_content was not issued"), false);
+});
+
+test("stripStaleReasoning drops reasoning and orphaned call ids", () => {
+  const payload = { model: "m", input: [thinking, { ...call }, text] };
+  const stripped = stripStaleReasoning(payload) as { input: any[] };
+  assert.ok(stripped);
+  assert.ok(!stripped.input.some((m: any) => m.type === "reasoning"));
+  assert.ok(stripped.input.some((m: any) => m.type === "function_call" && m.call_id === "call_1" && !("id" in m)));
+  assert.equal(stripStaleReasoning({ input: [text] }), null);
+  assert.equal(stripStaleReasoning({ messages: [] }), null);
+});
+
+test("Zen rotation retries once without replayed reasoning", async () => {
+  const p = zenProvider();
+  const model = muse(p);
+  const withHistory = {
+    messages: [
+      ...context.messages,
+      {
+        role: "assistant" as const,
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "stop" as const,
+        timestamp: 1,
+        content: [{ type: "thinking" as const, thinking: "", thinkingSignature: JSON.stringify(thinking) }],
+      },
+    ],
+  };
+  let secondCalls = 0;
+  const bodies2: any[] = [];
+  const fetch2: FetchFunction = async (_url, init) => {
+    secondCalls++;
+    bodies2.push(JSON.parse(String((init as { body?: unknown })?.body)));
+    if (secondCalls === 1) return Response.json({ error: { message: "Error from provider (Console): Upstream request failed: [invalid_request_error] reasoning `encrypted_content` was not issued to this caller", type: "invalid_request_error", param: null } }, { status: 400 });
+    return response([text]);
+  };
+  const retried = await p.streamSimple(model, withHistory, { fetch: fetch2, maxRetries: 0 }).result();
+  assert.equal(retried.stopReason, "stop", retried.errorMessage);
+  assert.equal(secondCalls, 2);
+  assert.ok(bodies2[0].input.some((m: any) => m.type === "reasoning" && m.encrypted_content === "opaque-signature"));
+  assert.ok(!bodies2[1].input.some((m: any) => m.type === "reasoning"));
+  // Non-encrypted 400s are not retried.
+  let plainCalls = 0;
+  const plain = await p.streamSimple(model, context, { fetch: (async () => { plainCalls++; return Response.json({ error: { message: "Bad request" } }, { status: 400 }); }) as FetchFunction, maxRetries: 0 }).result();
+  assert.equal(plain.stopReason, "error");
+  assert.equal(plainCalls, 1);
 });

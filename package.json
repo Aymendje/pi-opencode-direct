@@ -1,6 +1,6 @@
 {
   "name": "pi-opencode-direct",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Keyless OpenCode Zen free models for Pi, using native HTTP APIs",
   "type": "module",
   "license": "MIT",

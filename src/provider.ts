@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   createProvider,
-  type Api, type Model, type Provider, type StreamOptions,
+  type Api, type FetchFunction, type Model, type Provider, type StreamOptions,
 } from "@earendil-works/pi-ai";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
@@ -19,6 +19,71 @@ export function freeModels(): Model<Api>[] {
 
 export function sessionHeader(sessionId: string): string {
   return createHash("sha256").update(`${PROVIDER_ID}:${sessionId}`).digest("hex");
+}
+
+/**
+ * Zen routes `x-opencode-session` to a sticky backend so `reasoning.encrypted_content`
+ * replays normally. After idle expiry or long tasks Zen can move the session to a
+ * different instance that no longer holds the encryption key, and the upstream
+ * rejects the replay with 400 `reasoning `encrypted_content` was not issued to
+ * this caller` (or `encrypted content could not be verified`).
+ */
+export function isEncryptedContentError(status: number, bodyText: string): boolean {
+  if (status !== 400) return false;
+  return /encrypted[_ ]content/i.test(bodyText);
+}
+
+/**
+ * Drop stale Responses `reasoning` items so a retried request looks like a fresh
+ * session (which Zen always accepts). Function-call item ids are also dropped
+ * while `call_id` is kept: OpenAI validates that `fc_*` ids were paired with the
+ * original `rs_*` reasoning items, so keeping orphaned ids would 400 again.
+ * Returns null when there is nothing to strip.
+ */
+export function stripStaleReasoning(payload: unknown): unknown | null {
+  if (!payload || typeof payload !== "object") return null;
+  const input = (payload as { input?: unknown }).input;
+  if (!Array.isArray(input)) return null;
+  if (!input.some((item) => (item as { type?: unknown })?.type === "reasoning")) return null;
+  const nextInput = input
+    .filter((item) => (item as { type?: unknown })?.type !== "reasoning")
+    .map((item) => {
+      const typed = item as { type?: unknown; id?: unknown } | null;
+      if ((typed?.type === "function_call" || typed?.type === "custom_tool_call") && typeof typed.id === "string") {
+        const { id: _dropped, ...rest } = typed as Record<string, unknown>;
+        return rest;
+      }
+      return item;
+    });
+  return { ...(payload as Record<string, unknown>), input: nextInput };
+}
+
+/** Wrap fetch with a single retry that drops stale reasoning on Zen rotation. */
+export function withEncryptedContentFallback(inner?: FetchFunction): FetchFunction {
+  const base: FetchFunction = inner ?? globalThis.fetch;
+  return (async (url: unknown, init?: unknown) => {
+    const first = await (base as (u: never, i: never) => Promise<Response>)(url as never, init as never);
+    if (first.status !== 400) return first;
+    let text = "";
+    try {
+      text = await first.clone().text();
+    } catch {
+      return first;
+    }
+    if (!isEncryptedContentError(first.status, text)) return first;
+    let parsed: unknown;
+    try {
+      const raw = (init as { body?: unknown } | undefined)?.body;
+      if (typeof raw !== "string") return first;
+      parsed = JSON.parse(raw);
+    } catch {
+      return first;
+    }
+    const stripped = stripStaleReasoning(parsed);
+    if (!stripped) return first;
+    const nextInit = { ...((init as Record<string, unknown>) ?? {}), body: JSON.stringify(stripped) };
+    return (base as (u: never, i: never) => Promise<Response>)(url as never, nextInit as never);
+  }) as FetchFunction;
 }
 
 /** Reuse Pi's native serializers, streaming parsers, reasoning, and tool handling. */
@@ -54,11 +119,15 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       apiKey: "anonymous",
       timeoutMs: options?.timeoutMs ?? 180_000,
       maxRetries: options?.maxRetries ?? 2,
+      // Retry once without replayed reasoning when Zen rotates backends and the
+      // old encrypted_content key is gone. Runs before streaming starts, so the
+      // caller sees a single normal stream.
+      fetch: withEncryptedContentFallback(options?.fetch as FetchFunction | undefined) as T["fetch"],
       headers: {
         ...headers,
         Authorization: null,
         "x-opencode-session": sessionHeader(options?.sessionId ?? getSessionId() ?? fallbackSession),
-        "User-Agent": "pi-opencode-direct/0.1.0",
+        "User-Agent": "pi-opencode-direct/0.1.1",
       },
     };
   }
@@ -76,7 +145,7 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       const signal = ctx.signal;
       const response = await fetch(`${BASE_URL}/models`, {
         signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
-        headers: { "User-Agent": "pi-opencode-direct/0.1.0" },
+        headers: { "User-Agent": "pi-opencode-direct/0.1.1" },
       });
       if (!response.ok) throw new Error(`Zen model catalogue: HTTP ${response.status}`);
       const body = await response.json() as { data?: { id?: unknown }[] };
