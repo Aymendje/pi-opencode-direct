@@ -21,10 +21,15 @@ npm pack --dry-run
 
 The tarball should contain only `package.json`, `src/index.ts`,
 `src/provider.ts`, `README.md`, `CHANGELOG.md`, and `LICENSE`. Tests, CI,
-node_modules, and local settings are excluded. The Pi packages are peers;
-npm installs them as peers during package installation. Do not omit peer
-dependencies: the native transport subpath imports need them even though Pi
-also supplies its core extension API.
+node_modules, and local settings are excluded. `@earendil-works/pi-ai` is a
+real dependency (pinned to the validated Pi version), not peer-only: Pi
+installs extensions with `--legacy-peer-deps`, which never auto-installs
+peers, so a peer-only declaration fails to load on machines where no sibling
+extension happens to provide `pi-ai` (`Cannot find module
+... openai-completions.lazy`). Keep the peer entries too for dedupe
+signaling, and bump the pinned dependency together with `devDependencies`
+when re-validating against a new Pi. `@earendil-works/pi-coding-agent` stays
+peer-only: it is imported as types, which are erased before runtime.
 
 Commit and push the reviewed release, then authenticate with the npm account
 that will own the package and publish:
@@ -48,7 +53,9 @@ the npm package.
 
 Update `CHANGELOG.md`, bump the package version with
 `npm version patch --no-git-tag-version` (or `minor` / `major`), and update both
-User-Agent version strings in `src/provider.ts`. Run verification, review and
+User-Agent version strings in `src/provider.ts`. If re-validating against a
+newer Pi, bump the pinned `@earendil-works/pi-ai` entry in both `dependencies`
+and `devDependencies` to the new Pi version first. Run verification, review and
 commit the release, then publish. Each npm version can only be published once.
 
 Live verification is optional: `npm run test:live` sends two real free-tier

@@ -127,7 +127,7 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
         ...headers,
         Authorization: null,
         "x-opencode-session": sessionHeader(options?.sessionId ?? getSessionId() ?? fallbackSession),
-        "User-Agent": "pi-opencode-direct/0.1.1",
+        "User-Agent": "pi-opencode-direct/0.1.2",
       },
     };
   }
@@ -145,7 +145,7 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       const signal = ctx.signal;
       const response = await fetch(`${BASE_URL}/models`, {
         signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
-        headers: { "User-Agent": "pi-opencode-direct/0.1.1" },
+        headers: { "User-Agent": "pi-opencode-direct/0.1.2" },
       });
       if (!response.ok) throw new Error(`Zen model catalogue: HTTP ${response.status}`);
       const body = await response.json() as { data?: { id?: unknown }[] };
