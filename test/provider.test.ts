@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createModels, Type, type Model, type Api, type FetchFunction } from "@earendil-works/pi-ai";
-import { freeModels, zenProvider, PROVIDER_ID, sessionHeader, isEncryptedContentError, stripStaleReasoning } from "../src/provider.ts";
+import { freeModels, zenProvider, PROVIDER_ID, sessionHeader, requestHeader, OPENCODE_USER_AGENT, isEncryptedContentError, stripStaleReasoning } from "../src/provider.ts";
 
 const muse = (p = zenProvider()) => p.getModels().find(m => m.id === "muse-spark-1.3-contributor-free")!;
 const context = { messages: [{ role: "user" as const, content: "Test", timestamp: 1 }] };
@@ -63,7 +63,7 @@ test("anonymous Responses requests preserve xhigh, images, and text-before-tool 
   assert.ok(result.content.some(b => b.type === "thinking" && b.thinkingSignature?.includes("opaque-signature")));
   const request = c.calls[0];
   assert.equal(request.url, "https://opencode.ai/zen/v1/responses");
-  assert.equal(request.headers.get("authorization"), null);
+  assert.equal(request.headers.get("authorization"), "Bearer public");
   assert.equal(request.headers.get("x-opencode-session"), sessionHeader("session-a"));
   assert.equal(request.body.reasoning.effort, "xhigh");
   assert.equal(request.body.tools[0].name, "lookup");
@@ -79,6 +79,27 @@ test("session affinity is stable per session and explicit thinking is respected"
   assert.equal(c.calls[0].body.reasoning.effort, "low");
   assert.equal(c.calls[0].headers.get("x-opencode-session"), c.calls[1].headers.get("x-opencode-session"));
   assert.notEqual(c.calls[0].headers.get("x-opencode-session"), c.calls[2].headers.get("x-opencode-session"));
+});
+
+test("opencode session ids use ses_ hex+base62 structure and stay stable", () => {
+  for (const s of ["session-a", "first", "second"]) {
+    const id = sessionHeader(s);
+    assert.match(id, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  }
+  assert.equal(sessionHeader("first"), sessionHeader("first"));
+  assert.notEqual(sessionHeader("first"), sessionHeader("second"));
+  assert.match(requestHeader(), /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+});
+
+test("responses requests send opencode headers and matching cache key", async () => {
+  const p = zenProvider(); const c = capture();
+  await p.streamSimple(muse(p), context, { fetch: c.fetch, sessionId: "session-a" }).result();
+  const request = c.calls[0];
+  assert.equal(request.headers.get("x-opencode-client"), "cli");
+  assert.equal(request.headers.get("x-opencode-project"), "global");
+  assert.match(request.headers.get("x-opencode-request") ?? "", /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  assert.equal(request.headers.get("user-agent"), OPENCODE_USER_AGENT);
+  assert.equal(request.body.prompt_cache_key, request.headers.get("x-opencode-session"));
 });
 
 test("tool result replay keeps matching call IDs and reasoning signatures", async () => {
@@ -104,7 +125,7 @@ test("Chat Completions models use their native endpoint anonymously", async () =
   const result = await p.streamSimple(model, context, { fetch, sessionId: "chat-a" }).result();
   assert.equal(result.stopReason, "stop", result.errorMessage);
   assert.equal(url, "https://opencode.ai/zen/v1/chat/completions");
-  assert.equal(headers.get("authorization"), null);
+  assert.equal(headers.get("authorization"), "Bearer public");
   assert.equal(headers.get("x-opencode-session"), sessionHeader("chat-a"));
 });
 

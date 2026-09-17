@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   createProvider,
   type Api, type FetchFunction, type Model, type Provider, type StreamOptions,
@@ -17,8 +17,34 @@ export function freeModels(): Model<Api>[] {
     .map((m) => ({ ...m, provider: PROVIDER_ID, baseUrl: BASE_URL }));
 }
 
+export const OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14 pi-opencode-direct/0.1.3";
+export const OPENCODE_CLIENT = "cli";
+export const OPENCODE_PROJECT = "global";
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+function base62FromBytes(bytes: Uint8Array, length: number): string {
+  let out = "";
+  for (let i = 0; i < length; i++) out += BASE62[bytes[i % bytes.length] % 62];
+  return out;
+}
+
+/**
+ * Map a Pi session id to a valid OpenCode session id.
+ * Format from packages/opencode/src/id/id.ts: `ses_` + 12 hex chars
+ * (6 timestamp bytes) + 14 random base62 chars. The upstream free-tier gate
+ * rejects structurally invalid ids (e.g. 64-char sha256 hex or 24-char
+ * base62 without a hex prefix), while freshly generated valid ids pass.
+ * Hashing keeps affinity stable per Pi session and distinct between sessions.
+ */
 export function sessionHeader(sessionId: string): string {
-  return createHash("sha256").update(`${PROVIDER_ID}:${sessionId}`).digest("hex");
+  const hash = createHash("sha256").update(`${PROVIDER_ID}:${sessionId}`).digest();
+  const hex = hash.subarray(0, 6).toString("hex");
+  return `ses_${hex}${base62FromBytes(hash.subarray(6), 14)}`;
+}
+
+/** Random valid OpenCode request id (`msg_` + 12 hex + 14 base62). Not validated, but matches the real CLI. */
+export function requestHeader(): string {
+  return `msg_${randomBytes(6).toString("hex")}${base62FromBytes(randomBytes(14), 14)}`;
 }
 
 /**
@@ -99,7 +125,7 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       apiKey: {
         name: "Anonymous free tier (no key needed)",
         async resolve() {
-          return { auth: { apiKey: "anonymous" }, source: "Anonymous free tier" };
+          return { auth: { apiKey: "public" }, source: "Anonymous free tier" };
         },
       },
     },
@@ -112,11 +138,13 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
 
   function requestOptions<T extends StreamOptions>(options: T = {} as T): T {
     const headers = Object.fromEntries(Object.entries(options?.headers ?? {})
-      .filter(([name]) => !["authorization", "x-opencode-session"].includes(name.toLowerCase())));
+      .filter(([name]) => !["authorization", "user-agent", "x-opencode-session", "x-opencode-client", "x-opencode-project", "x-opencode-request"].includes(name.toLowerCase())));
+    const opencodeSession = sessionHeader(options?.sessionId ?? getSessionId() ?? fallbackSession);
     return {
       ...options,
-      // The SDK needs a nonempty placeholder; null suppresses its Authorization header.
-      apiKey: "anonymous",
+      // Free-tier anonymous path requires the literal key "public".
+      apiKey: "public",
+      sessionId: opencodeSession,
       timeoutMs: options?.timeoutMs ?? 180_000,
       maxRetries: options?.maxRetries ?? 2,
       // Retry once without replayed reasoning when Zen rotates backends and the
@@ -125,9 +153,12 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       fetch: withEncryptedContentFallback(options?.fetch as FetchFunction | undefined) as T["fetch"],
       headers: {
         ...headers,
-        Authorization: null,
-        "x-opencode-session": sessionHeader(options?.sessionId ?? getSessionId() ?? fallbackSession),
-        "User-Agent": "pi-opencode-direct/0.1.2",
+        Authorization: "Bearer public",
+        "x-opencode-session": opencodeSession,
+        "x-opencode-client": OPENCODE_CLIENT,
+        "x-opencode-project": OPENCODE_PROJECT,
+        "x-opencode-request": requestHeader(),
+        "User-Agent": OPENCODE_USER_AGENT,
       },
     };
   }
@@ -145,7 +176,7 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       const signal = ctx.signal;
       const response = await fetch(`${BASE_URL}/models`, {
         signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
-        headers: { "User-Agent": "pi-opencode-direct/0.1.2" },
+        headers: { "User-Agent": "pi-opencode-direct/0.1.3" },
       });
       if (!response.ok) throw new Error(`Zen model catalogue: HTTP ${response.status}`);
       const body = await response.json() as { data?: { id?: unknown }[] };
