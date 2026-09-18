@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import {
   createProvider,
   type Api, type FetchFunction, type Model, type Provider, type StreamOptions,
@@ -278,6 +279,141 @@ export function patchGlobalFetchForZen(getSessionId: SessionGetter = () => undef
     }
   }) as typeof fetch;
   globalThis.fetch = guarded;
+}
+
+/**
+ * Same identity as the fetch guard, for callers that speak node:http/https
+ * directly (axios / node-fetch style code in any extension or in-process
+ * MCP tool). Accepts the header shapes Node allows (plain object, Headers
+ * instance, [name, value][] array, or undefined) and preserves a valid
+ * upstream session plus an existing Authorization.
+ */
+export type NodeHeadersInit =
+  | Record<string, string | string[] | number | undefined>
+  | [string, string][]
+  | Headers
+  | undefined;
+
+function readNodeHeader(headers: NodeHeadersInit, name: string): string | undefined {
+  if (!headers) return undefined;
+  const lower = name.toLowerCase();
+  if (headers instanceof Headers) return headers.get(name) ?? undefined;
+  if (Array.isArray(headers)) {
+    for (let i = headers.length - 1; i >= 0; i--) {
+      const pair = headers[i];
+      if (pair && pair[0]?.toLowerCase() === lower) return String(pair[1]);
+    }
+    return undefined;
+  }
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() !== lower) continue;
+    if (value === undefined) return undefined;
+    return Array.isArray(value) ? String(value[0]) : String(value);
+  }
+  return undefined;
+}
+
+export function applyZenHeadersToNodeHeaders(headers: NodeHeadersInit, getSessionId: SessionGetter = () => undefined): NodeHeadersInit {
+  let out = headers;
+  const set = (name: string, value: string): void => {
+    if (!out) {
+      out = { [name]: value };
+      return;
+    }
+    if (out instanceof Headers) {
+      out.set(name, value);
+      return;
+    }
+    if (Array.isArray(out)) {
+      const lower = name.toLowerCase();
+      out = [...out.filter((pair) => pair?.[0]?.toLowerCase() !== lower), [name, value] as [string, string]];
+      return;
+    }
+    const lower = name.toLowerCase();
+    for (const key of Object.keys(out)) {
+      if (key.toLowerCase() === lower) delete (out as Record<string, unknown>)[key];
+    }
+    (out as Record<string, string>)[name] = value;
+  };
+  const session = readNodeHeader(out, "x-opencode-session");
+  set("x-opencode-session", session && ZEN_SESSION_PATTERN.test(session) ? session : sessionHeader(getSessionId() ?? randomUUID()));
+  if (!readNodeHeader(out, "authorization")) set("Authorization", "Bearer public");
+  set("User-Agent", OPENCODE_USER_AGENT);
+  set("x-opencode-client", OPENCODE_CLIENT);
+  set("x-opencode-project", OPENCODE_PROJECT);
+  if (!readNodeHeader(out, "x-opencode-request")) set("x-opencode-request", requestHeader());
+  return out;
+}
+
+function splitHttpArgs(args: unknown[]): { options: Record<string, unknown>; callback: unknown } {
+  const [first, second, third] = args;
+  if (typeof first === "string" || first instanceof URL) {
+    const url = typeof first === "string" ? new URL(first) : first;
+    const opts = (typeof second === "object" && second !== null ? second : {}) as Record<string, unknown>;
+    return {
+      options: {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port,
+        path: `${url.pathname}${url.search}`,
+        ...opts,
+      },
+      callback: typeof second === "function" ? second : third,
+    };
+  }
+  return { options: { ...((first as Record<string, unknown> | undefined) ?? {}) }, callback: second };
+}
+
+export function isZenNodeRequestOptions(options: Record<string, unknown>): boolean {
+  const host = String(options.hostname ?? options.host ?? "").split(":")[0]?.toLowerCase();
+  return host === "opencode.ai" && String(options.path ?? "/").startsWith("/zen/v1");
+}
+
+/**
+ * Patch node:http/https request/get so non-fetch callers targeting Zen still
+ * carry the identity. Reload-safe via pristine-original stash on globalThis.
+ * Named-import capturers (`import { request } from "node:http"` resolved
+ * before this runs) and direct `undici` / WebSocket users are not covered —
+ * Zen transports are fetch/SSE, so this is a backstop, not the main path.
+ */
+const NODE_HTTP_ORIGINALS_KEY = "__piOpenCodeDirectNodeHttpOriginals";
+
+type NodeHttpModule = Record<string, (...args: never[]) => unknown>;
+
+function nodeHttpStash(): Map<string, (...args: never[]) => unknown> {
+  const g = globalThis as Record<string, unknown>;
+  const existing = g[NODE_HTTP_ORIGINALS_KEY];
+  if (existing instanceof Map) return existing as Map<string, (...args: never[]) => unknown>;
+  const created = new Map<string, (...args: never[]) => unknown>();
+  g[NODE_HTTP_ORIGINALS_KEY] = created;
+  return created;
+}
+
+export function patchNodeHttpForZen(getSessionId: SessionGetter = () => undefined): void {
+  const require = createRequire(import.meta.url);
+  const targets: [string, NodeHttpModule][] = [["http", require("node:http")], ["https", require("node:https")]];
+  const stash = nodeHttpStash();
+  for (const [modName, mod] of targets) {
+    for (const fnName of ["request", "get"]) {
+      const key = `${modName}.${fnName}`;
+      if (!stash.has(key) && typeof mod[fnName] === "function") stash.set(key, mod[fnName]);
+      const original = stash.get(key);
+      if (!original) continue;
+      const callOriginal = (self: unknown, args: unknown[]): unknown =>
+        (original as (...a: unknown[]) => unknown).apply(self, args);
+      const wrapped = function (this: unknown, ...args: unknown[]) {
+        try {
+          const { options, callback } = splitHttpArgs(args);
+          if (!isZenNodeRequestOptions(options)) return callOriginal(this, args);
+          options.headers = applyZenHeadersToNodeHeaders(options.headers as NodeHeadersInit, getSessionId) as unknown as Record<string, unknown>;
+          return callOriginal(this, [options, callback]);
+        } catch {
+          return callOriginal(this, args);
+        }
+      };
+      mod[fnName] = wrapped as (...args: never[]) => unknown;
+    }
+  }
 }
 
 /** Reuse Pi's native serializers, streaming parsers, reasoning, and tool handling. */

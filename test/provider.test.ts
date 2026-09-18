@@ -342,3 +342,61 @@ test("global fetch guard covers raw Zen requests and ignores other hosts", async
     delete (globalThis as any).__piOpenCodeDirectFetchOriginal;
   }
 });
+
+test("node:http guard injects Zen identity for Zen hosts only", async () => {
+  const mod = await import("../src/provider.ts");
+  const { createRequire } = await import("node:module");
+  const require = createRequire(import.meta.url);
+  const httpMod = require("node:http") as Record<string, (...args: any[]) => unknown>;
+  const httpsMod = require("node:https") as Record<string, (...args: any[]) => unknown>;
+  const savedHttpRequest = httpMod.request;
+  const savedHttpGet = httpMod.get;
+  const savedHttpsRequest = httpsMod.request;
+  const savedHttpsGet = httpsMod.get;
+  const stashKey = "__piOpenCodeDirectNodeHttpOriginals";
+  const savedStash = (globalThis as any)[stashKey];
+  try {
+    // Pure helper: all shapes.
+    const fromUndef = mod.applyZenHeadersToNodeHeaders(undefined, () => "helper-session") as Record<string, string>;
+    assert.equal(fromUndef["Authorization"], "Bearer public");
+    assert.equal(fromUndef["User-Agent"], OPENCODE_USER_AGENT);
+    assert.equal(fromUndef["x-opencode-session"], mod.sessionHeader("helper-session"));
+    const fromArray = mod.applyZenHeadersToNodeHeaders([["X-Opencode-Session", mod.sessionHeader("keep-me")], ["Accept", "x"]] as any, () => "other") as [string, string][];
+    assert.ok(fromArray.some(([k, v]) => k.toLowerCase() === "x-opencode-session" && v === mod.sessionHeader("keep-me")));
+    assert.ok(fromArray.some(([k]) => k === "x-opencode-client"));
+    const fromHeaders = mod.applyZenHeadersToNodeHeaders(new Headers({ Authorization: "Bearer real" }), () => "s") as Headers;
+    assert.equal(fromHeaders.get("authorization"), "Bearer real");
+
+    assert.equal(mod.isZenNodeRequestOptions({ hostname: "opencode.ai", path: "/zen/v1/responses" }), true);
+    assert.equal(mod.isZenNodeRequestOptions({ host: "opencode.ai:443", path: "/zen/v1/models" }), true);
+    assert.equal(mod.isZenNodeRequestOptions({ hostname: "example.com", path: "/zen/v1/responses" }), false);
+    assert.equal(mod.isZenNodeRequestOptions({ hostname: "opencode.ai", path: "/other" }), false);
+
+    // Wrapper delegation with stubbed originals (no network).
+    const received: { options: any }[] = [];
+    const stubOriginal = function (options: any) {
+      received.push({ options });
+      return { stubbed: true };
+    };
+    (globalThis as any)[stashKey] = new Map(Object.entries({
+      "http.request": stubOriginal, "http.get": stubOriginal,
+      "https.request": stubOriginal, "https.get": stubOriginal,
+    }));
+    mod.patchNodeHttpForZen(() => "node-session");
+    const out = httpMod.request({ hostname: "opencode.ai", path: "/zen/v1/responses", headers: {} }) as any;
+    assert.equal(out.stubbed, true);
+    assert.equal(received[0].options.headers["x-opencode-session"], mod.sessionHeader("node-session"));
+    assert.equal(received[0].options.headers["Authorization"], "Bearer public");
+    const before = received.length;
+    (httpMod.request as any)({ hostname: "example.com", path: "/" });
+    assert.equal(received[before].options.headers, undefined);
+    assert.equal(received[before].options.hostname, "example.com");
+  } finally {
+    httpMod.request = savedHttpRequest as any;
+    httpMod.get = savedHttpGet as any;
+    httpsMod.request = savedHttpsRequest as any;
+    httpsMod.get = savedHttpsGet as any;
+    if (savedStash === undefined) delete (globalThis as any)[stashKey];
+    else (globalThis as any)[stashKey] = savedStash;
+  }
+});

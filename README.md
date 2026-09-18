@@ -68,7 +68,10 @@ As a last resort, a fetch guard scoped strictly to `https://opencode.ai/zen/v1`
 adds the same identity at the network edge for any other in-process path
 (Pi core flows such as compaction, present or future) — other hosts pass
 through untouched, and a valid upstream session / existing Authorization are
-preserved.
+preserved. `node:http`/`https` callers (axios / node-fetch style, any extension
+or in-process MCP tool) get the same treatment. Separate processes, direct
+`undici` imports, and WebSocket are the only gaps — Zen transports are
+fetch/SSE, so those don't apply in practice.
 
 The `pi -p --no-session` subprocess transport is a separate process, so no
 in-process patch can cover it: it loads `--no-extensions` + Hermes only and

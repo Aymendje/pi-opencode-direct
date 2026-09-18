@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { patchCompatDirectTransport, patchGlobalFetchForZen, zenProvider } from "./provider.ts";
+import { patchCompatDirectTransport, patchGlobalFetchForZen, patchNodeHttpForZen, zenProvider } from "./provider.ts";
 
 export default function (pi: ExtensionAPI) {
   let context: ExtensionContext | undefined;
@@ -23,5 +23,12 @@ export default function (pi: ExtensionAPI) {
     patchGlobalFetchForZen(getSessionId);
   } catch {
     // Wrappers above already cover the known paths.
+  }
+  // Same for non-fetch callers (axios / node-fetch style) in any extension
+  // or in-process MCP tool.
+  try {
+    patchNodeHttpForZen(getSessionId);
+  } catch {
+    // Fetch-level coverage above is the common case.
   }
 }
