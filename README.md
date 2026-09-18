@@ -52,6 +52,30 @@ Requests use Pi's native retry handling (two retries by default) and a
 Muse Spark currently accepts only `tool_choice: auto`; normal Pi tool use does
 not require forced tool choice.
 
+## Memory extensions (pi-hermes-memory)
+
+Background-review direct transport (`pi-ai/compat completeSimple`) bypasses
+the `stream()` wrapper, so this extension patches the global compat registry
+at load: `opencode-zen-free` models get the full dynamic identity there too
+(`Bearer public`, OpenCode `User-Agent` / `x-opencode-client` / `project` /
+per-session `x-opencode-session` / per-request `x-opencode-request`, plus the
+encrypted-content retry), while other providers pass through untouched. No
+memory config needed for the default direct transport — and compat omission
+stays `off`, preserving Hermes `llmThinkingOverride: off` (no forced `xhigh`
+on this path).
+
+The `pi -p --no-session` subprocess transport loads `--no-extensions` +
+Hermes only, so it cannot see `opencode-zen-free` on its own. That path only
+runs when direct fails (or `reviewTransport` is forced to `subprocess`), so
+with direct fixed no config is needed. If you force subprocess, expose this
+package to the child with an absolute file path:
+
+```json
+{
+  "childExtensionPaths": ["/path/to/pi-opencode-direct/src/index.ts"]
+}
+```
+
 ## Development
 
 ```sh

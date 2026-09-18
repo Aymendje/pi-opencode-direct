@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+
+- Fix `pi-hermes-memory` background-review direct transport (`Memory auto-review failed ... FreeTierError ... can only be used from within OpenCode`): the OpenCode `User-Agent` / `x-opencode-client` / `x-opencode-project` identity now lives on `provider.headers`, `model.headers`, and `auth.resolve()` headers, not only in the `stream()`/`streamSimple()` wrapper. Side-channels that use `modelRegistry.getApiKeyAndHeaders()` + `pi-ai/compat completeSimple` (which never call the wrapper) now pass the gate. Dynamic `x-opencode-session` / `x-opencode-request` / `Authorization` stay per-request in the wrapper.
+- Zero-config memory side-channels: the extension also patches the global `pi-ai/compat` API registry at load so `completeSimple`/`streamSimple` calls that bypass Models send the full dynamic Zen identity (`Bearer public`, OpenCode `User-Agent` / `x-opencode-client` / `x-opencode-project`, per-session `x-opencode-session`, per-request `x-opencode-request`, encrypted-content fetch retry) for `opencode-zen-free` models only. No `llmModelOverride` / `childExtensionPaths` needed for the default direct transport. Deliberately no `xhigh` default on this path: compat omission stays `off`, preserving `llmThinkingOverride: off`. Reload-safe via pristine-original stash (no wrapper stacking).
+- Note: the Hermes `pi -p` subprocess transport still spawns with `--no-extensions` + only Hermes loaded, so `opencode-zen-free/... not found` there needs `"childExtensionPaths": ["/path/to/pi-opencode-direct/src/index.ts"]` in `hermes-memory-config.json` — only relevant when direct fails or `reviewTransport` is forced to `subprocess`.
+
 ## 0.1.3
 
 - Recover from OpenCode's free-tier `from within OpenCode` gate: send `Authorization: Bearer public`, the exact OpenCode `User-Agent` / `x-opencode-client` / `x-opencode-project` / `x-opencode-request` headers, and a structurally valid `ses_` session id (`12` hex + `14` base62) with a matching `prompt_cache_key`.

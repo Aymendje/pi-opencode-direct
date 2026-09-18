@@ -3,6 +3,7 @@ import {
   createProvider,
   type Api, type FetchFunction, type Model, type Provider, type StreamOptions,
 } from "@earendil-works/pi-ai";
+import { getApiProvider, registerApiProvider } from "@earendil-works/pi-ai/compat";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
@@ -14,12 +15,41 @@ const SUPPORTED_APIS = new Set(["openai-responses", "openai-completions"]);
 export function freeModels(): Model<Api>[] {
   return opencodeProvider().getModels()
     .filter((m) => SUPPORTED_APIS.has(m.api) && Object.values(m.cost).every((cost) => cost === 0))
-    .map((m) => ({ ...m, provider: PROVIDER_ID, baseUrl: BASE_URL }));
+    .map((m) => ({
+      ...m,
+      provider: PROVIDER_ID,
+      baseUrl: BASE_URL,
+      // Static gate headers so side-channels that bypass zenProvider().stream()
+      // (e.g. pi-hermes-memory direct transport via pi-ai/compat completeSimple,
+      // which resolves auth + model.headers but never calls our requestOptions
+      // wrapper) still look like OpenCode. Dynamic per-request headers
+      // (x-opencode-session / x-opencode-request / Authorization) are added in
+      // requestOptions() for the main path; compat createClient merges
+      // model.headers then options headers, so these survive both paths.
+      headers: {
+        ...m.headers,
+        ...STATIC_ZEN_HEADERS,
+      },
+    }));
 }
 
-export const OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14 pi-opencode-direct/0.1.3";
+export const OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14 pi-opencode-direct/0.1.4";
 export const OPENCODE_CLIENT = "cli";
 export const OPENCODE_PROJECT = "global";
+
+/**
+ * Static free-tier gate headers. Must stay in sync with requestOptions().
+ * Exposed on provider.headers, model.headers, and auth.resolve() so
+ * out-of-band completions (pi-hermes-memory direct transport, which uses
+ * modelRegistry.getApiKeyAndHeaders() + compat completeSimple and never
+ * touches requestOptions) still send the OpenCode identity Zen gates on.
+ * Per-request values (session/request/auth) stay dynamic in requestOptions().
+ */
+export const STATIC_ZEN_HEADERS: Record<string, string> = {
+  "User-Agent": OPENCODE_USER_AGENT,
+  "x-opencode-client": OPENCODE_CLIENT,
+  "x-opencode-project": OPENCODE_PROJECT,
+};
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 function base62FromBytes(bytes: Uint8Array, length: number): string {
@@ -112,6 +142,84 @@ export function withEncryptedContentFallback(inner?: FetchFunction): FetchFuncti
   }) as FetchFunction;
 }
 
+/**
+ * Patch the global pi-ai/compat API registry so side-channels that bypass
+ * Models (e.g. pi-hermes-memory direct transport via compat completeSimple)
+ * still send the Zen identity for our models — zero per-user config.
+ *
+ * Only models with provider === PROVIDER_ID are touched; everything else
+ * delegates to the previously registered implementation unchanged. Unlike the
+ * Models-path streamSimple wrapper, no xhigh reasoning default is applied
+ * here: compat callers signal "off" by omitting reasoning (hermes sets
+ * llmThinkingOverride off → reasoning undefined), and forcing xhigh would
+ * regress their explicit choice. Idempotent across /reload: re-patching
+ * refreshes the session getter in place instead of stacking wrappers.
+ */
+type CompatApiEntry = ReturnType<typeof getApiProvider>;
+type SessionGetter = () => string | undefined;
+/** Pristine compat entries, stashed on globalThis so /reload (fresh module
+ * state, surviving registry) re-wraps the original instead of stacking a
+ * wrapper on top of the previous wrapper. */
+const COMPAT_ORIGINALS_KEY = "__piOpenCodeDirectCompatOriginals";
+function compatOriginals(): Map<string, NonNullable<CompatApiEntry>> {
+  const g = globalThis as Record<string, unknown>;
+  const existing = g[COMPAT_ORIGINALS_KEY];
+  if (existing instanceof Map) return existing as Map<string, NonNullable<CompatApiEntry>>;
+  const created = new Map<string, NonNullable<CompatApiEntry>>();
+  g[COMPAT_ORIGINALS_KEY] = created;
+  return created;
+}
+
+function compatRequestOptions<T extends StreamOptions>(options: T, getSessionId: SessionGetter, fallbackSession: string): T {
+  const headers = Object.fromEntries(Object.entries(options?.headers ?? {})
+    .filter(([name]) => !["authorization", "user-agent", "x-opencode-session", "x-opencode-client", "x-opencode-project", "x-opencode-request"].includes(name.toLowerCase())));
+  const opencodeSession = sessionHeader(options?.sessionId ?? getSessionId() ?? fallbackSession);
+  return {
+    ...options,
+    apiKey: "public",
+    sessionId: opencodeSession,
+    timeoutMs: options?.timeoutMs ?? 180_000,
+    maxRetries: options?.maxRetries ?? 2,
+    fetch: withEncryptedContentFallback(options?.fetch as FetchFunction | undefined) as T["fetch"],
+    headers: {
+      ...headers,
+      Authorization: "Bearer public",
+      "x-opencode-session": opencodeSession,
+      "x-opencode-client": OPENCODE_CLIENT,
+      "x-opencode-project": OPENCODE_PROJECT,
+      "x-opencode-request": requestHeader(),
+      "User-Agent": OPENCODE_USER_AGENT,
+    },
+  };
+}
+
+export function patchCompatDirectTransport(getSessionId: SessionGetter = () => undefined): void {
+  const stash = compatOriginals();
+  for (const api of SUPPORTED_APIS) {
+    if (!stash.has(api)) {
+      const current = getApiProvider(api);
+      if (!current) continue;
+      stash.set(api, current);
+    }
+    const original = stash.get(api)!;
+    const fallbackSession = randomUUID();
+    const origStream = (original.stream as (...args: never[]) => unknown).bind(original);
+    const origStreamSimple = (original.streamSimple as (...args: never[]) => unknown).bind(original);
+    registerApiProvider({
+      api: api as Parameters<typeof registerApiProvider>[0]["api"],
+      stream: ((model: Model<Api>, context: never, options: StreamOptions) => {
+        if ((model as Model<Api>).provider !== PROVIDER_ID) return origStream(model as never, context as never, options as never);
+        return origStream(model as never, context as never, compatRequestOptions(options, getSessionId, fallbackSession) as never);
+      }) as never,
+      streamSimple: ((model: Model<Api>, context: never, options: StreamOptions) => {
+        if ((model as Model<Api>).provider !== PROVIDER_ID) return origStreamSimple(model as never, context as never, options as never);
+        // No reasoning default here (see doc comment): compat omission means off.
+        return origStreamSimple(model as never, context as never, compatRequestOptions(options, getSessionId, fallbackSession) as never);
+      }) as never,
+    }, "pi-opencode-direct");
+  }
+}
+
 /** Reuse Pi's native serializers, streaming parsers, reasoning, and tool handling. */
 export function zenProvider(getSessionId: () => string | undefined = () => undefined): Provider {
   const fallbackSession = randomUUID();
@@ -121,11 +229,17 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
     id: PROVIDER_ID,
     name: "OpenCode Zen Free",
     baseUrl: BASE_URL,
+    headers: { ...STATIC_ZEN_HEADERS },
     auth: {
       apiKey: {
         name: "Anonymous free tier (no key needed)",
         async resolve() {
-          return { auth: { apiKey: "public" }, source: "Anonymous free tier" };
+          // Headers here feed modelRegistry.getApiKeyAndHeaders(), which is
+          // what side-channels like hermes direct transport forward as
+          // options.headers into compat createClient (model.headers +
+          // optionsHeaders merge). Main path still sets full dynamic headers
+          // in requestOptions().
+          return { auth: { apiKey: "public", headers: { ...STATIC_ZEN_HEADERS } }, source: "Anonymous free tier" };
         },
       },
     },
@@ -137,30 +251,11 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
   });
 
   function requestOptions<T extends StreamOptions>(options: T = {} as T): T {
-    const headers = Object.fromEntries(Object.entries(options?.headers ?? {})
-      .filter(([name]) => !["authorization", "user-agent", "x-opencode-session", "x-opencode-client", "x-opencode-project", "x-opencode-request"].includes(name.toLowerCase())));
-    const opencodeSession = sessionHeader(options?.sessionId ?? getSessionId() ?? fallbackSession);
-    return {
-      ...options,
-      // Free-tier anonymous path requires the literal key "public".
-      apiKey: "public",
-      sessionId: opencodeSession,
-      timeoutMs: options?.timeoutMs ?? 180_000,
-      maxRetries: options?.maxRetries ?? 2,
-      // Retry once without replayed reasoning when Zen rotates backends and the
-      // old encrypted_content key is gone. Runs before streaming starts, so the
-      // caller sees a single normal stream.
-      fetch: withEncryptedContentFallback(options?.fetch as FetchFunction | undefined) as T["fetch"],
-      headers: {
-        ...headers,
-        Authorization: "Bearer public",
-        "x-opencode-session": opencodeSession,
-        "x-opencode-client": OPENCODE_CLIENT,
-        "x-opencode-project": OPENCODE_PROJECT,
-        "x-opencode-request": requestHeader(),
-        "User-Agent": OPENCODE_USER_AGENT,
-      },
-    };
+    // Shared with the compat side-channel patch below. Free-tier anonymous
+    // path requires the literal key "public"; the fetch wrapper retries once
+    // without replayed reasoning when Zen rotates backends, before streaming
+    // starts, so the caller sees a single normal stream.
+    return compatRequestOptions(options, getSessionId, fallbackSession);
   }
 
   return {
@@ -176,7 +271,7 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       const signal = ctx.signal;
       const response = await fetch(`${BASE_URL}/models`, {
         signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
-        headers: { "User-Agent": "pi-opencode-direct/0.1.3" },
+        headers: { "User-Agent": "pi-opencode-direct/0.1.4" },
       });
       if (!response.ok) throw new Error(`Zen model catalogue: HTTP ${response.status}`);
       const body = await response.json() as { data?: { id?: unknown }[] };

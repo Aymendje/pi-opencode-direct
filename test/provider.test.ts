@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createModels, Type, type Model, type Api, type FetchFunction } from "@earendil-works/pi-ai";
-import { freeModels, zenProvider, PROVIDER_ID, sessionHeader, requestHeader, OPENCODE_USER_AGENT, isEncryptedContentError, stripStaleReasoning } from "../src/provider.ts";
+import { freeModels, zenProvider, PROVIDER_ID, sessionHeader, requestHeader, OPENCODE_USER_AGENT, STATIC_ZEN_HEADERS, isEncryptedContentError, stripStaleReasoning } from "../src/provider.ts";
 
 const muse = (p = zenProvider()) => p.getModels().find(m => m.id === "muse-spark-1.3-contributor-free")!;
 const context = { messages: [{ role: "user" as const, content: "Test", timestamp: 1 }] };
@@ -191,4 +191,110 @@ test("Zen rotation retries once without replayed reasoning", async () => {
   const plain = await p.streamSimple(model, context, { fetch: (async () => { plainCalls++; return Response.json({ error: { message: "Bad request" } }, { status: 400 }); }) as FetchFunction, maxRetries: 0 }).result();
   assert.equal(plain.stopReason, "error");
   assert.equal(plainCalls, 1);
+});
+
+test("static gate headers survive side-channels that bypass requestOptions()", async () => {
+  // pi-hermes-memory direct transport resolves auth via
+  // modelRegistry.getApiKeyAndHeaders(model) and calls compat completeSimple,
+  // which merges model.headers then options headers in createClient. It never
+  // calls zenProvider().stream() wrapper, so the OpenCode identity must live
+  // on the model + provider + auth, not only in requestOptions().
+  const p = zenProvider();
+  for (const m of p.getModels()) {
+    assert.equal(m.headers?.["User-Agent"], OPENCODE_USER_AGENT);
+    assert.equal(m.headers?.["x-opencode-client"], "cli");
+    assert.equal(m.headers?.["x-opencode-project"], "global");
+  }
+  const providerEntry = (p as unknown as { headers?: Record<string, string> }).headers
+    ?? (p as unknown as { id: string }).id === PROVIDER_ID ? STATIC_ZEN_HEADERS : undefined;
+  assert.deepEqual(providerEntry, STATIC_ZEN_HEADERS);
+
+  const models = createModels();
+  models.setProvider(p);
+  const model = muse(p);
+  const resolved = await models.getAuth(model);
+  assert.equal(resolved?.auth.apiKey, "public");
+  assert.equal(resolved?.auth.headers?.["User-Agent"], OPENCODE_USER_AGENT);
+  assert.equal(resolved?.auth.headers?.["x-opencode-client"], "cli");
+  assert.equal(resolved?.auth.headers?.["x-opencode-project"], "global");
+
+  // Simulate compat createClient merge: { UA: pi-default, ...model.headers } + optionsHeaders
+  const merged: Record<string, string> = {
+    "User-Agent": "pi/0.0.0",
+    ...(model.headers ?? {}),
+    ...(resolved?.auth.headers ?? {}),
+  };
+  assert.equal(merged["User-Agent"], OPENCODE_USER_AGENT);
+  assert.equal(merged["x-opencode-client"], "cli");
+  assert.equal(merged["x-opencode-project"], "global");
+});
+
+test("compat side-channel patch injects Zen identity for our models only", async () => {
+  const compat = await import("@earendil-works/pi-ai/compat");
+  const { patchCompatDirectTransport, sessionHeader: sesh } = await import("../src/provider.ts");
+  try {
+    patchCompatDirectTransport(() => "compat-session");
+    const api = compat.getApiProvider("openai-responses");
+    assert.ok(api);
+
+    // Zen model via compat: headers injected, no forced xhigh (omission = off).
+    const seen: { headers: Headers; body: any }[] = [];
+    const spy: FetchFunction = async (_url, init) => {
+      seen.push({ headers: new Headers(init?.headers), body: JSON.parse(String((init as { body?: unknown })?.body)) });
+      const events = [
+        { type: "response.output_item.added", output_index: 0, item: text },
+        { type: "response.output_item.done", output_index: 0, item: text },
+        { type: "response.completed", response: { id: "resp_c", status: "completed", output: [text], usage } },
+      ];
+      return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""), { headers: { "Content-Type": "text/event-stream" } });
+    };
+    const zm = muse();
+    const out = await (api.streamSimple as any)(zm, context, { fetch: spy }).result();
+    assert.equal(out.stopReason, "stop", out.errorMessage);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].headers.get("authorization"), "Bearer public");
+    assert.equal(seen[0].headers.get("user-agent"), OPENCODE_USER_AGENT);
+    assert.equal(seen[0].headers.get("x-opencode-client"), "cli");
+    assert.equal(seen[0].headers.get("x-opencode-project"), "global");
+    assert.equal(seen[0].headers.get("x-opencode-session"), sesh("compat-session"));
+    assert.match(seen[0].headers.get("x-opencode-request") ?? "", /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    assert.equal(seen[0].body.reasoning, undefined);
+
+    // Non-Zen model passes through untouched (no Zen headers).
+    const other: Model<Api> = {
+      id: "other-model", name: "Other", api: "openai-responses", provider: "other-provider",
+      baseUrl: "https://example.com/v1", reasoning: false, input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8000, maxTokens: 8000,
+    };
+    const seenOther: Headers[] = [];
+    const spyOther: FetchFunction = async (_url, init) => {
+      seenOther.push(new Headers(init?.headers));
+      const events = [
+        { type: "response.output_item.added", output_index: 0, item: text },
+        { type: "response.output_item.done", output_index: 0, item: text },
+        { type: "response.completed", response: { id: "resp_o", status: "completed", output: [text], usage } },
+      ];
+      return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""), { headers: { "Content-Type": "text/event-stream" } });
+    };
+    await (api.streamSimple as any)(other, context, { fetch: spyOther, apiKey: "other-key" }).result();
+    assert.equal(seenOther[0].get("x-opencode-session"), null);
+    assert.equal(seenOther[0].get("x-opencode-client"), null);
+
+    // Re-patching re-wraps the pristine original (no stacking) with the fresh getter.
+    patchCompatDirectTransport(() => "compat-session-2");
+    const seen2: { headers: Headers; body: any }[] = [];
+    const spy2: FetchFunction = async (_url, init) => {
+      seen2.push({ headers: new Headers(init?.headers), body: JSON.parse(String((init as { body?: unknown })?.body)) });
+      const events = [
+        { type: "response.output_item.added", output_index: 0, item: text },
+        { type: "response.output_item.done", output_index: 0, item: text },
+        { type: "response.completed", response: { id: "resp_c2", status: "completed", output: [text], usage } },
+      ];
+      return new Response(events.map(e => `data: ${JSON.stringify(e)}\n\n`).join(""), { headers: { "Content-Type": "text/event-stream" } });
+    };
+    await (compat.getApiProvider("openai-responses")!.streamSimple as any)(zm, context, { fetch: spy2 }).result();
+    assert.equal(seen2[0].headers.get("x-opencode-session"), sesh("compat-session-2"));
+  } finally {
+    compat.resetApiProviders();
+  }
 });
