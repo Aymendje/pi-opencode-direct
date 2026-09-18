@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { patchCompatDirectTransport, zenProvider } from "./provider.ts";
+import { patchCompatDirectTransport, patchGlobalFetchForZen, zenProvider } from "./provider.ts";
 
 export default function (pi: ExtensionAPI) {
   let context: ExtensionContext | undefined;
@@ -10,11 +10,18 @@ export default function (pi: ExtensionAPI) {
   pi.registerProvider(zenProvider(getSessionId));
   // Cover side-channels that bypass Models (e.g. pi-hermes-memory direct
   // transport via pi-ai/compat): same Zen identity, no per-user config.
-  // Never let a compat-registry failure break provider registration.
+  // Never let a side-channel patch failure break provider registration.
   try {
     patchCompatDirectTransport(getSessionId);
   } catch {
     // Main-path streaming still works; direct side-channels fall back to
-    // static model/auth headers from 0.1.4 (compat patch below covers the rest).
+    // static model/auth headers.
+  }
+  // Last resort: any other in-process fetch to Zen (present/future Pi flows
+  // such as compaction if rerouted) still carries the identity.
+  try {
+    patchGlobalFetchForZen(getSessionId);
+  } catch {
+    // Wrappers above already cover the known paths.
   }
 }

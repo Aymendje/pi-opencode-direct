@@ -64,11 +64,18 @@ memory config needed for the default direct transport — and compat omission
 stays `off`, preserving Hermes `llmThinkingOverride: off` (no forced `xhigh`
 on this path).
 
-The `pi -p --no-session` subprocess transport loads `--no-extensions` +
-Hermes only, so it cannot see `opencode-zen-free` on its own. That path only
-runs when direct fails (or `reviewTransport` is forced to `subprocess`), so
-with direct fixed no config is needed. If you force subprocess, expose this
-package to the child with an absolute file path:
+As a last resort, a fetch guard scoped strictly to `https://opencode.ai/zen/v1`
+adds the same identity at the network edge for any other in-process path
+(Pi core flows such as compaction, present or future) — other hosts pass
+through untouched, and a valid upstream session / existing Authorization are
+preserved.
+
+The `pi -p --no-session` subprocess transport is a separate process, so no
+in-process patch can cover it: it loads `--no-extensions` + Hermes only and
+cannot see `opencode-zen-free` on its own. That path only runs when direct
+fails (or `reviewTransport` is forced to `subprocess`), so with direct fixed
+no config is needed. If you force subprocess, expose this package to the
+child with an absolute file path:
 
 ```json
 {

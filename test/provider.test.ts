@@ -298,3 +298,47 @@ test("compat side-channel patch injects Zen identity for our models only", async
     compat.resetApiProviders();
   }
 });
+
+test("global fetch guard covers raw Zen requests and ignores other hosts", async () => {
+  const { patchGlobalFetchForZen, sessionHeader: sesh2 } = await import("../src/provider.ts");
+  const realFetch = globalThis.fetch;
+  try {
+    const calls: { url: string; headers: Headers }[] = [];
+    (globalThis as any).__piOpenCodeDirectFetchOriginal = (async (input: any, init?: any) => {
+      calls.push({ url: String(typeof input === "string" ? input : input?.url ?? input), headers: new Headers(init?.headers) });
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+
+    patchGlobalFetchForZen(() => "guard-session");
+    // Other hosts pass through untouched.
+    await globalThis.fetch("https://example.com/api", { headers: { "User-Agent": "keep-me" } });
+    assert.equal(calls[0].headers.get("user-agent"), "keep-me");
+    assert.equal(calls[0].headers.get("x-opencode-session"), null);
+
+    // Raw Zen request gets the full identity with a valid session.
+    await globalThis.fetch("https://opencode.ai/zen/v1/responses", { method: "POST" });
+    const zen = calls[1].headers;
+    assert.equal(zen.get("authorization"), "Bearer public");
+    assert.equal(zen.get("user-agent"), OPENCODE_USER_AGENT);
+    assert.equal(zen.get("x-opencode-client"), "cli");
+    assert.equal(zen.get("x-opencode-project"), "global");
+    assert.equal(zen.get("x-opencode-session"), sesh2("guard-session"));
+    assert.match(zen.get("x-opencode-request") ?? "", /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+
+    // Upstream-set identity is preserved (affinity + explicit auth).
+    await globalThis.fetch("https://opencode.ai/zen/v1/chat/completions", {
+      headers: { Authorization: "Bearer real-key", "x-opencode-session": sesh2("upstream-session") },
+    });
+    const kept = calls[2].headers;
+    assert.equal(kept.get("authorization"), "Bearer real-key");
+    assert.equal(kept.get("x-opencode-session"), sesh2("upstream-session"));
+
+    // Re-patching refreshes the getter without stacking (one underlying call).
+    patchGlobalFetchForZen(() => "guard-session-2");
+    await globalThis.fetch("https://opencode.ai/zen/v1/models");
+    assert.equal(calls[3].headers.get("x-opencode-session"), sesh2("guard-session-2"));
+  } finally {
+    globalThis.fetch = realFetch;
+    delete (globalThis as any).__piOpenCodeDirectFetchOriginal;
+  }
+});

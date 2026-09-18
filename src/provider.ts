@@ -220,6 +220,66 @@ export function patchCompatDirectTransport(getSessionId: SessionGetter = () => u
   }
 }
 
+/**
+ * Last-resort guard: wrap global fetch so ANY in-process request to the Zen
+ * base URL carries the free-tier identity, even paths that bypass both the
+ * Models wrapper and the compat patch (e.g. Pi core flows in present or
+ * future versions that call fetch directly, such as compaction if it ever
+ * stops routing through the provider). Scoped strictly to BASE_URL; all
+ * other hosts pass through untouched. A valid upstream x-opencode-session
+ * (set by the wrappers, preserving affinity) and an existing Authorization
+ * are preserved; anything missing is filled with the anonymous identity.
+ * Reload-safe: always re-wraps the pristine original stashed on globalThis,
+ * so re-patching refreshes the session getter instead of stacking wrappers.
+ */
+const FETCH_GUARD_ORIGINAL_KEY = "__piOpenCodeDirectFetchOriginal";
+const ZEN_SESSION_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+
+function isZenRequest(input: unknown): boolean {
+  try {
+    if (typeof input === "string") return input.startsWith(BASE_URL);
+    if (input instanceof URL) return input.href.startsWith(BASE_URL);
+    if (input && typeof input === "object") {
+      const maybe = (input as { url?: unknown }).url;
+      if (typeof maybe === "string") return maybe.startsWith(BASE_URL);
+    }
+    return String(input).startsWith(BASE_URL);
+  } catch {
+    return false;
+  }
+}
+
+export function patchGlobalFetchForZen(getSessionId: SessionGetter = () => undefined): void {
+  const g = globalThis as Record<string, unknown>;
+  if (!g[FETCH_GUARD_ORIGINAL_KEY]) g[FETCH_GUARD_ORIGINAL_KEY] = globalThis.fetch;
+  const original = g[FETCH_GUARD_ORIGINAL_KEY] as typeof fetch;
+  const callOriginal = (input: unknown, init: unknown): Promise<Response> =>
+    (original as (u: never, i: never) => Promise<Response>)(input as never, init as never);
+  const guarded = (async (input: unknown, init?: unknown) => {
+    try {
+      if (!isZenRequest(input)) return callOriginal(input, init);
+      const rawInit = (init ?? {}) as Record<string, unknown>;
+      const headers = new Headers(rawInit.headers as HeadersInit | undefined);
+      const existingSession = headers.get("x-opencode-session");
+      headers.set(
+        "x-opencode-session",
+        existingSession && ZEN_SESSION_PATTERN.test(existingSession)
+          ? existingSession
+          : sessionHeader(getSessionId() ?? randomUUID()),
+      );
+      if (!headers.get("authorization")) headers.set("Authorization", "Bearer public");
+      headers.set("User-Agent", OPENCODE_USER_AGENT);
+      headers.set("x-opencode-client", OPENCODE_CLIENT);
+      headers.set("x-opencode-project", OPENCODE_PROJECT);
+      if (!headers.get("x-opencode-request")) headers.set("x-opencode-request", requestHeader());
+      return callOriginal(input, { ...rawInit, headers });
+    } catch {
+      return callOriginal(input, init);
+    }
+  }) as typeof fetch;
+  globalThis.fetch = guarded;
+}
+
 /** Reuse Pi's native serializers, streaming parsers, reasoning, and tool handling. */
 export function zenProvider(getSessionId: () => string | undefined = () => undefined): Provider {
   const fallbackSession = randomUUID();
