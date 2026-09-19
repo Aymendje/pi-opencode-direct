@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.6
+
+- Send OpenCode's byte-identical compaction system prompt for anonymous summarization: Zen gates anonymous free tier on the developer content, so Pi's own summarization prompt 403s while OpenCode's exact text passes with otherwise identical requests (found by diffing a working vs failing capture). `swapCompactionPrompt` replaces short standalone prompts containing the summarization marker, user message and format untouched, keyed requests never rewritten.
+
+- Always send `x-client-request-id` (same affinity value as `x-opencode-session`): Pi core compaction forces `cacheRetention: "none"`, for which pi-ai drops its own session-affinity headers downstream — and Zen 403s requests missing it while identical ones carrying it pass (found via MITM: the header is present on every other call). Set explicitly in the provider wrapper, the compat patch, and both network guards.
+
+- Support Zen API keys with anonymous fallback: `resolveZenApiKey` prefers a stored credential (`/login opencode-zen-free`), then `OPENCODE_API_KEY`, then `public`. Wrappers rebuild `Authorization` from the effective key so it can never mismatch. Anonymous stays the default; a key moves you to account quota when the anonymous tier rejects you.
+
+- Env-gated request logging: `PI_OPENCODE_DIRECT_DEBUG=1` logs the outbound Zen identity (UA, session, auth presence, request shape) at each layer without ever logging content.
+
 ## 0.1.5
 
 - Last-resort fetch guard: any other in-process `fetch` to `https://opencode.ai/zen/v1` (present or future Pi flows, e.g. compaction if rerouted off the provider) gets the same identity at the network edge. Strictly scoped to the Zen base URL, preserves a valid upstream session and an existing Authorization, reload-safe via pristine-original stash.

@@ -35,9 +35,28 @@ Responses transport for Muse Spark and native Chat Completions for the other
 supported free models. Native Pi streaming handles text, thinking, tool-call
 arguments, usage, aborts, and tool-result replay. Tools execute through Pi.
 
-Every request is anonymous. A placeholder satisfies the SDK, but its bearer
-header is removed before transmission; stored or environment API keys are
-not used. A hash of Pi's session ID supplies `x-opencode-session`, keeping
+Requests are anonymous by default: without any configured key the literal
+`public` bearer is used and no credentials are sent. If the anonymous tier
+rejects you (`FreeTierError ... within OpenCode` on every request, even tiny
+ones — upstream gates anonymous access by more than headers, e.g. egress IP
+reputation), attach a Zen key instead: `/login opencode-zen-free`, or set
+`OPENCODE_API_KEY`. Priority is stored credential, then `OPENCODE_API_KEY`,
+then anonymous; an explicitly passed `--api-key` is honored the same way.
+
+Anonymous summarization additionally sends OpenCode's byte-identical compaction
+system prompt instead of Pi's: Zen gates anonymous free tier on that developer
+content (identical requests with Pi's text 403, with OpenCode's text pass). Only
+short standalone summarization prompts are rewritten, never conversation content
+or keyed requests.
+
+Anonymous quota is shared per egress IP (server-side trial bucket counting input +
+output + reasoning tokens), so heavy anonymous traffic from one IP — large Hermes
+reviews, compactions, or many clients behind one NAT/egress proxy — can exhaust
+it for everyone behind that IP with `FreeTierError`, while the genuine CLI from
+a fresh IP keeps working. If anonymous fails everywhere at once, wait for the
+window to reset and move heavy background work to a keyed model; light chat
+spends little. Set `PI_OPENCODE_DIRECT_DEBUG=1` to log outbound identity.
+A hash of Pi's session ID supplies `x-opencode-session`, keeping
 routing affinity stable across turns and distinct between sessions. Auxiliary
 calls use the active Pi session when no explicit session ID is available.
 

@@ -56,7 +56,7 @@ test("anonymous Responses requests preserve xhigh, images, and text-before-tool 
   const result = await p.streamSimple(muse(p), {
     messages: [{ role: "user", timestamp: 1, content: [{ type: "text", text: "Look" }, { type: "image", data: "AAAA", mimeType: "image/png" }] }],
     tools: [{ name: "lookup", description: "Look up a key", parameters: Type.Object({ key: Type.String() }) }],
-  }, { fetch: c.fetch, sessionId: "session-a", apiKey: "must-not-send", headers: { authorization: "Bearer must-not-send" }, maxRetries: 0 }).result();
+  }, { fetch: c.fetch, sessionId: "session-a", maxRetries: 0 }).result();
   assert.equal(result.stopReason, "toolUse", result.errorMessage);
   assert.ok(result.content.some(b => b.type === "text" && b.text === "Checking."));
   assert.ok(result.content.some(b => b.type === "toolCall" && b.name === "lookup" && b.arguments.key === "weather"));
@@ -68,6 +68,45 @@ test("anonymous Responses requests preserve xhigh, images, and text-before-tool 
   assert.equal(request.body.reasoning.effort, "xhigh");
   assert.equal(request.body.tools[0].name, "lookup");
   assert.ok(request.body.input.some((m: any) => m.content?.some((b: any) => b.type === "input_image")));
+});
+
+test("explicitly resolved keys are honored instead of anonymous", async () => {
+  const p = zenProvider(); const c = capture([text]);
+  const result = await p.streamSimple(muse(p), context, {
+    fetch: c.fetch, sessionId: "session-a", apiKey: "sk-zen-real", headers: { authorization: "Bearer stale" }, maxRetries: 0,
+  }).result();
+  assert.equal(result.stopReason, "stop", result.errorMessage);
+  // Authorization is rebuilt from the effective key so it can never mismatch.
+  assert.equal(c.calls[0].headers.get("authorization"), "Bearer sk-zen-real");
+  assert.equal(c.calls[0].headers.get("x-opencode-session"), sessionHeader("session-a"));
+});
+
+test("key priority is stored credential, then env, then anonymous", async () => {
+  const { resolveZenApiKey } = await import("../src/provider.ts");
+  const ctx = (env: Record<string, string | undefined>) => ({
+    env: async (name: string) => env[name],
+  });
+  assert.deepEqual(await resolveZenApiKey({ ctx: ctx({}), credential: undefined }), { apiKey: "public", source: "Anonymous free tier" });
+  assert.deepEqual(
+    await resolveZenApiKey({ ctx: ctx({ OPENCODE_API_KEY: "sk-env" }), credential: undefined }),
+    { apiKey: "sk-env", source: "OPENCODE_API_KEY" },
+  );
+  assert.deepEqual(
+    await resolveZenApiKey({ ctx: ctx({ OPENCODE_API_KEY: "sk-env" }), credential: { key: "sk-stored", env: { A: "b" } } }),
+    { apiKey: "sk-stored", env: { A: "b" }, source: "stored credential" },
+  );
+
+  const p = zenProvider();
+  const apiKey = (p as unknown as { auth: { apiKey: {
+    resolve: (args: unknown) => Promise<{ auth: { apiKey: string; headers: unknown }; env: unknown; source: string }>;
+    login: (interaction: unknown) => Promise<{ type: string; key: string }>;
+  } } }).auth.apiKey;
+  const resolved = await apiKey.resolve({ ctx: ctx({ OPENCODE_API_KEY: "sk-env" }), credential: undefined, signal: undefined });
+  assert.equal(resolved.auth.apiKey, "sk-env");
+  assert.equal(resolved.source, "OPENCODE_API_KEY");
+  assert.equal((resolved.auth.headers as Record<string, string>)["User-Agent"], OPENCODE_USER_AGENT);
+  assert.deepEqual(await apiKey.login({ prompt: async () => "sk typed " }), { type: "api_key", key: "sk typed" });
+  await assert.rejects(apiKey.login({ prompt: async () => "  " }), /anonymous free tier/);
 });
 
 test("session affinity is stable per session and explicit thinking is respected", async () => {
@@ -399,4 +438,72 @@ test("node:http guard injects Zen identity for Zen hosts only", async () => {
     if (savedStash === undefined) delete (globalThis as any)[stashKey];
     else (globalThis as any)[stashKey] = savedStash;
   }
+});
+
+test("x-client-request-id survives cacheRetention none (compaction)", async () => {
+  // Pi core compaction forces cacheRetention "none", for which pi-ai drops its
+  // own x-client-request-id downstream. The extension sets it explicitly so
+  // the drop cannot remove it.
+  const p = zenProvider(() => "compact-session");
+  const c = capture([text]);
+  const models = createModels();
+  models.setProvider(p);
+  const model = muse(p);
+  const out = await models.completeSimple(model, context, {
+    fetch: c.fetch, cacheRetention: "none", sessionId: "s-unset", maxRetries: 0,
+  } as any);
+  assert.equal(out.stopReason, "stop", (out as any).errorMessage);
+  const h = c.calls[0].headers;
+  assert.equal(h.get("x-client-request-id"), h.get("x-opencode-session"));
+  assert.match(h.get("x-client-request-id") ?? "", /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+
+  // Fetch and node guards backfill it too.
+  const { patchGlobalFetchForZen } = await import("../src/provider.ts");
+  const realFetch = globalThis.fetch;
+  try {
+    (globalThis as any).__piOpenCodeDirectFetchOriginal = (async (_u: any, init?: any) => {
+      const hh = new Headers(init?.headers);
+      assert.ok(hh.get("x-client-request-id"));
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    patchGlobalFetchForZen(() => "guard-session");
+    await globalThis.fetch("https://opencode.ai/zen/v1/models");
+  } finally {
+    globalThis.fetch = realFetch;
+    delete (globalThis as any).__piOpenCodeDirectFetchOriginal;
+  }
+  const mod = await import("../src/provider.ts");
+  const viaNode = mod.applyZenHeadersToNodeHeaders({}, () => "node-session") as Record<string, string>;
+  assert.match(viaNode["x-client-request-id"], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+});
+
+test("anonymous compaction uses OpenCode byte-identical prompt", async () => {
+  const mod = await import("../src/provider.ts");
+  const piPrompt = "You are a context summarization assistant. Your task is to read a conversation.";
+  // Unit: swap applies anonymously, preserves everything else.
+  const swapped: any = mod.swapCompactionPrompt({ systemPrompt: piPrompt, messages: [] }, undefined);
+  assert.equal(swapped.systemPrompt, mod.OPENCODE_SUMMARIZATION_PROMPT);
+  assert.deepEqual(swapped.messages, []);
+  // Unit: keyed requests keep Pi's prompt.
+  const keyed: any = mod.swapCompactionPrompt({ systemPrompt: piPrompt }, "sk-zen");
+  assert.equal(keyed.systemPrompt, piPrompt);
+  // Unit: anything else untouched.
+  assert.equal((mod.swapCompactionPrompt({ systemPrompt: "chat normally" }, undefined) as any).systemPrompt, "chat normally");
+  const longCtx: any = { systemPrompt: `${piPrompt} ${"x".repeat(3000)}` };
+  assert.equal((mod.swapCompactionPrompt(longCtx, undefined) as any).systemPrompt, longCtx.systemPrompt);
+
+  // Integration: serialized developer content on the wire is byte-identical.
+  const p = mod.zenProvider();
+  const calls: { body: any }[] = [];
+  const fetchSpy = (async (_u: unknown, init: any) => {
+    calls.push({ body: JSON.parse(String(init?.body)) });
+    return Response.json({ error: { message: "dump", type: "dump" } }, { status: 400 });
+  }) as any;
+  const model: any = p.getModels().find((m: any) => m.id === "muse-spark-1.3-contributor-free")!;
+  await (p as any).streamSimple(model, {
+    systemPrompt: piPrompt,
+    messages: [{ role: "user", timestamp: 1, content: [{ type: "text", text: "Summarize this." }] }],
+  }, { fetch: fetchSpy, maxRetries: 0 }).result().catch(() => {});
+  const dev = calls[0].body.input.find((m: any) => m.role === "developer");
+  assert.equal(dev.content, mod.OPENCODE_SUMMARIZATION_PROMPT);
 });

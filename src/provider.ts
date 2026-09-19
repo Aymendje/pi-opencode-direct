@@ -34,7 +34,7 @@ export function freeModels(): Model<Api>[] {
     }));
 }
 
-export const OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14 pi-opencode-direct/0.1.5";
+export const OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14 pi-opencode-direct/0.1.6";
 export const OPENCODE_CLIENT = "cli";
 export const OPENCODE_PROJECT = "global";
 
@@ -171,20 +171,87 @@ function compatOriginals(): Map<string, NonNullable<CompatApiEntry>> {
   return created;
 }
 
+/**
+ * OpenCode's own compaction system prompt, byte-identical as shipped in the
+ * CLI binary. Zen's anonymous free tier gates on it: Pi's own summarization
+ * prompt ("You are a context summarization assistant...") gets 403
+ * FreeTierError while this text passes with otherwise identical requests.
+ */
+export const OPENCODE_SUMMARIZATION_PROMPT =
+  "You are a context summarization agent. You are given a conversation between a user and an agent. Your goal is to produce a structured summary matching the format specified so another coding agent can continue the work.\n" +
+  "Always follow the exact output structure requested by the user prompt. Keep every section, preserve exact file paths and identifiers when known, and prefer terse bullets over paragraphs.\n" +
+  "Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.\n";
+
+/** Marker identifying Pi's own compaction system prompt (0.85.1 wording). */
+const PI_SUMMARIZATION_MARKER = "context summarization";
+
+/**
+ * Swap Pi's compaction system prompt for OpenCode's byte-identical one when
+ * sending anonymously to Zen. The user message (which carries Pi's output
+ * format) is untouched, so Pi still gets the structure it expects. Only
+ * applies to short standalone prompts containing the marker — never to
+ * conversation-bearing content — and never when a real API key is in use.
+ * Returns the context unchanged when no swap applies.
+ */
+export function swapCompactionPrompt<T>(context: T, apiKey: unknown): T {
+  const key = typeof apiKey === "string" && apiKey.trim() ? apiKey : "public";
+  if (key !== "public") return context;
+  if (!context || typeof context !== "object") return context;
+  const sys = (context as { systemPrompt?: unknown }).systemPrompt;
+  if (typeof sys !== "string") return context;
+  if (sys.length > 2000 || !sys.toLowerCase().includes(PI_SUMMARIZATION_MARKER)) return context;
+  return { ...(context as Record<string, unknown>), systemPrompt: OPENCODE_SUMMARIZATION_PROMPT } as T;
+}
+
+/** Env var for an optional Zen API key (account quota instead of anonymous). */
+export const ZEN_API_KEY_ENV = "OPENCODE_API_KEY";
+
+/**
+ * Key priority: stored credential (`/login opencode-zen-free`) first, then
+ * OPENCODE_API_KEY, then anonymous "public". Returned env passes stored
+ * provider-scoped values through to the request.
+ */
+export async function resolveZenApiKey(input: {
+  ctx: { env: (name: string) => Promise<string | undefined> };
+  credential?: { key?: string; env?: Record<string, string> } | undefined;
+}): Promise<{ apiKey: string; env?: Record<string, string>; source: string }> {
+  const stored = input.credential?.key?.trim();
+  if (stored) return { apiKey: stored, env: input.credential?.env, source: "stored credential" };
+  let envKey: string | undefined;
+  try {
+    envKey = (await input.ctx.env(ZEN_API_KEY_ENV))?.trim() || undefined;
+  } catch {
+    envKey = undefined;
+  }
+  if (envKey) return { apiKey: envKey, source: ZEN_API_KEY_ENV };
+  return { apiKey: "public", source: "Anonymous free tier" };
+}
+
 function compatRequestOptions<T extends StreamOptions>(options: T, getSessionId: SessionGetter, fallbackSession: string): T {
   const headers = Object.fromEntries(Object.entries(options?.headers ?? {})
     .filter(([name]) => !["authorization", "user-agent", "x-opencode-session", "x-opencode-client", "x-opencode-project", "x-opencode-request"].includes(name.toLowerCase())));
   const opencodeSession = sessionHeader(options?.sessionId ?? getSessionId() ?? fallbackSession);
+  // An explicitly resolved key (stored credential, env, or --api-key) is
+  // honored; otherwise anonymous. Authorization is rebuilt from the effective
+  // key so a stale incoming header can never mismatch it.
+  const rawKey = (options as { apiKey?: unknown } | undefined)?.apiKey;
+  const effectiveApiKey = typeof rawKey === "string" && rawKey.trim() ? rawKey : "public";
   return {
     ...options,
-    apiKey: "public",
+    apiKey: effectiveApiKey,
+    // Pi core compaction forces cacheRetention "none", for which pi-ai drops
+    // its own session-affinity headers (x-client-request-id) downstream — yet
+    // Zen 403s requests missing it while identical ones carrying it pass.
+    // Set it explicitly here (options headers merge last) so the drop cannot
+    // remove it. Same affinity value as x-opencode-session.
     sessionId: opencodeSession,
     timeoutMs: options?.timeoutMs ?? 180_000,
     maxRetries: options?.maxRetries ?? 2,
     fetch: withEncryptedContentFallback(options?.fetch as FetchFunction | undefined) as T["fetch"],
     headers: {
       ...headers,
-      Authorization: "Bearer public",
+      Authorization: `Bearer ${effectiveApiKey}`,
+      "x-client-request-id": opencodeSession,
       "x-opencode-session": opencodeSession,
       "x-opencode-client": OPENCODE_CLIENT,
       "x-opencode-project": OPENCODE_PROJECT,
@@ -210,12 +277,18 @@ export function patchCompatDirectTransport(getSessionId: SessionGetter = () => u
       api: api as Parameters<typeof registerApiProvider>[0]["api"],
       stream: ((model: Model<Api>, context: never, options: StreamOptions) => {
         if ((model as Model<Api>).provider !== PROVIDER_ID) return origStream(model as never, context as never, options as never);
-        return origStream(model as never, context as never, compatRequestOptions(options, getSessionId, fallbackSession) as never);
+        const ctx = swapCompactionPrompt(context, (options as { apiKey?: unknown } | undefined)?.apiKey);
+        const processed = compatRequestOptions(options, getSessionId, fallbackSession);
+        debugLog(`${identitySummary(new Headers(processed.headers as HeadersInit | undefined), "compat")} ${shapeSummary(ctx, options)}`);
+        return origStream(model as never, ctx as never, processed as never);
       }) as never,
       streamSimple: ((model: Model<Api>, context: never, options: StreamOptions) => {
         if ((model as Model<Api>).provider !== PROVIDER_ID) return origStreamSimple(model as never, context as never, options as never);
         // No reasoning default here (see doc comment): compat omission means off.
-        return origStreamSimple(model as never, context as never, compatRequestOptions(options, getSessionId, fallbackSession) as never);
+        const ctx = swapCompactionPrompt(context, (options as { apiKey?: unknown } | undefined)?.apiKey);
+        const processed = compatRequestOptions(options, getSessionId, fallbackSession);
+        debugLog(`${identitySummary(new Headers(processed.headers as HeadersInit | undefined), "compat")} ${shapeSummary(ctx, options)}`);
+        return origStreamSimple(model as never, ctx as never, processed as never);
       }) as never,
     }, "pi-opencode-direct");
   }
@@ -235,6 +308,57 @@ export function patchCompatDirectTransport(getSessionId: SessionGetter = () => u
  */
 const FETCH_GUARD_ORIGINAL_KEY = "__piOpenCodeDirectFetchOriginal";
 const ZEN_SESSION_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+
+/** Set PI_OPENCODE_DIRECT_DEBUG=1 to log Zen-bound request identity to stderr. */
+function debugLog(message: string): void {
+  try {
+    if (typeof process !== "undefined" && process.env?.PI_OPENCODE_DIRECT_DEBUG === "1") {
+      console.error(`[pi-opencode-direct] ${message}`);
+    }
+  } catch {
+    // Logging must never break requests.
+  }
+}
+
+function identitySummary(headers: Headers, via: string): string {
+  const ua = headers.get("User-Agent") ?? "(missing)";
+  const session = headers.get("x-opencode-session") ?? "(missing)";
+  const auth = headers.get("authorization") ?? "(missing)";
+  const arid = headers.get("x-client-request-id") ?? "(missing)";
+  return `${via} ua=${ua.slice(0, 28)}... session=${session.slice(0, 12)}... auth=${auth.slice(0, 14)}... arid=${arid.slice(0, 12)}...`;
+}
+
+/** Sizes and shape only — never content. */
+function shapeSummary(context: unknown, options: unknown): string {
+  try {
+    const ctx = (context ?? {}) as { messages?: unknown[]; tools?: unknown[] };
+    const opt = (options ?? {}) as { reasoning?: unknown; maxTokens?: unknown };
+    let chars = 0;
+    if (Array.isArray(ctx.messages)) {
+      for (const m of ctx.messages) {
+        const s = JSON.stringify(m) ?? "";
+        chars += s.length;
+        if (chars > 10_000_000) break;
+      }
+    }
+    const tools = Array.isArray(ctx.tools) ? ctx.tools.length : 0;
+    return `msgs=${Array.isArray(ctx.messages) ? ctx.messages.length : "?"} chars~${chars} tools=${tools} reasoning=${String(opt.reasoning ?? "(default)")}`;
+  } catch {
+    return "shape=(unavailable)";
+  }
+}
+
+function zenPath(input: unknown): string {
+  try {
+    if (typeof input === "string") return new URL(input).pathname;
+    if (input instanceof URL) return input.pathname;
+    const url = (input as { url?: unknown })?.url;
+    if (typeof url === "string") return new URL(url).pathname;
+    return String(input).slice(0, 80);
+  } catch {
+    return "(unparseable)";
+  }
+}
 
 function isZenRequest(input: unknown): boolean {
   try {
@@ -273,7 +397,18 @@ export function patchGlobalFetchForZen(getSessionId: SessionGetter = () => undef
       headers.set("x-opencode-client", OPENCODE_CLIENT);
       headers.set("x-opencode-project", OPENCODE_PROJECT);
       if (!headers.get("x-opencode-request")) headers.set("x-opencode-request", requestHeader());
-      return callOriginal(input, { ...rawInit, headers });
+      if (!headers.get("x-client-request-id")) headers.set("x-client-request-id", headers.get("x-opencode-session") ?? sessionHeader(getSessionId() ?? randomUUID()));
+      debugLog(identitySummary(headers, "fetch"));
+      const startedAt = Date.now();
+      try {
+        const response = await callOriginal(input, { ...rawInit, headers });
+        debugLog(`fetch <- ${response.status} ${zenPath(input)} after ${Date.now() - startedAt}ms`);
+        return response;
+      } catch (error) {
+        const detail = error instanceof Error ? `${error.name}: ${error.message || "(empty)"}` : String(error);
+        debugLog(`fetch FAILED ${zenPath(input)} after ${Date.now() - startedAt}ms: ${detail.slice(0, 200)}`);
+        throw error;
+      }
     } catch {
       return callOriginal(input, init);
     }
@@ -342,6 +477,9 @@ export function applyZenHeadersToNodeHeaders(headers: NodeHeadersInit, getSessio
   set("x-opencode-client", OPENCODE_CLIENT);
   set("x-opencode-project", OPENCODE_PROJECT);
   if (!readNodeHeader(out, "x-opencode-request")) set("x-opencode-request", requestHeader());
+  if (!readNodeHeader(out, "x-client-request-id")) {
+    set("x-client-request-id", readNodeHeader(out, "x-opencode-session") ?? sessionHeader(getSessionId() ?? randomUUID()));
+  }
   return out;
 }
 
@@ -428,14 +566,28 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
     headers: { ...STATIC_ZEN_HEADERS },
     auth: {
       apiKey: {
-        name: "Anonymous free tier (no key needed)",
-        async resolve() {
+        name: "OpenCode Zen API key (or anonymous free tier)",
+        async resolve({ ctx, credential }) {
           // Headers here feed modelRegistry.getApiKeyAndHeaders(), which is
           // what side-channels like hermes direct transport forward as
           // options.headers into compat createClient (model.headers +
           // optionsHeaders merge). Main path still sets full dynamic headers
           // in requestOptions().
-          return { auth: { apiKey: "public", headers: { ...STATIC_ZEN_HEADERS } }, source: "Anonymous free tier" };
+          const resolved = await resolveZenApiKey({ ctx, credential });
+          return {
+            auth: { apiKey: resolved.apiKey, headers: { ...STATIC_ZEN_HEADERS } },
+            env: resolved.env,
+            source: resolved.source,
+          };
+        },
+        async login(interaction) {
+          const entered = await interaction.prompt({
+            type: "secret",
+            message: "OpenCode Zen API key (leave empty for the anonymous free tier)",
+          });
+          const key = entered.trim();
+          if (!key) throw new Error("No key entered. The anonymous free tier needs no login — just use the models.");
+          return { type: "api_key", key };
         },
       },
     },
@@ -446,12 +598,14 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
     },
   });
 
-  function requestOptions<T extends StreamOptions>(options: T = {} as T): T {
+  function requestOptions<T extends StreamOptions>(options: T = {} as T, context?: unknown): T {
     // Shared with the compat side-channel patch below. Free-tier anonymous
     // path requires the literal key "public"; the fetch wrapper retries once
     // without replayed reasoning when Zen rotates backends, before streaming
     // starts, so the caller sees a single normal stream.
-    return compatRequestOptions(options, getSessionId, fallbackSession);
+    const processed = compatRequestOptions(options, getSessionId, fallbackSession);
+    debugLog(`${identitySummary(new Headers(processed.headers as HeadersInit | undefined), "provider")} ${shapeSummary(context, options)}`);
+    return processed;
   }
 
   return {
@@ -467,7 +621,7 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       const signal = ctx.signal;
       const response = await fetch(`${BASE_URL}/models`, {
         signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
-        headers: { "User-Agent": "pi-opencode-direct/0.1.5" },
+        headers: { "User-Agent": "pi-opencode-direct/0.1.6" },
       });
       if (!response.ok) throw new Error(`Zen model catalogue: HTTP ${response.status}`);
       const body = await response.json() as { data?: { id?: unknown }[] };
@@ -480,11 +634,13 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       });
     },
     stream(model, context, options) {
-      return provider.stream(model, context, requestOptions(options));
+      const ctx = swapCompactionPrompt(context, (options as { apiKey?: unknown } | undefined)?.apiKey);
+      return provider.stream(model, ctx, requestOptions(options, ctx));
     },
     streamSimple(model, context, options) {
-      return provider.streamSimple(model, context, {
-        ...requestOptions(options),
+      const ctx = swapCompactionPrompt(context, (options as { apiKey?: unknown } | undefined)?.apiKey);
+      return provider.streamSimple(model, ctx, {
+        ...requestOptions(options, ctx),
         reasoning: options?.reasoning ?? (model.id.startsWith("muse-spark-") ? "xhigh" : undefined),
       });
     },
