@@ -4,9 +4,7 @@ import {
   createProvider,
   type Api, type FetchFunction, type Model, type Provider, type StreamOptions,
 } from "@earendil-works/pi-ai";
-import { getApiProvider, registerApiProvider } from "@earendil-works/pi-ai/compat";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
-import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+import { getApiProvider, openAICompletionsApi, openAIResponsesApi, registerApiProvider } from "@earendil-works/pi-ai/compat";
 import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
 
 export const PROVIDER_ID = "opencode-zen-free";
