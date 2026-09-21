@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.7
+
+- Pi 0.86.1 compatibility: adapt to the `TranscriptContext` Custom Streaming API. All `stream`/`streamSimple` paths (provider wrapper and compat side-channel patch) normalize legacy `Context` (`systemPrompt`/`tools`) to transcripts via `normalizeContext`, so direct calls keep working while Pi core sends transcripts. `swapCompactionPrompt` handles both shapes — legacy `systemPrompt` and transcript system messages read via `getCurrentSystemPrompt` (tools checked via `getCurrentTools`) — still limited to short standalone summarization prompts, user message and format untouched, keyed requests never rewritten. Debug shape summaries count transcript-declared tools.
+- Pin `@earendil-works/pi-ai` to `0.86.1` in dependencies and devDependencies; tests build transcript contexts the way Pi core does.
+- Ignore local Pi state (`/.pi` in `.gitignore`).
+
 ## 0.1.6
 
 - Send OpenCode's byte-identical compaction system prompt for anonymous summarization: Zen gates anonymous free tier on the developer content, so Pi's own summarization prompt 403s while OpenCode's exact text passes with otherwise identical requests (found by diffing a working vs failing capture). `swapCompactionPrompt` replaces short standalone prompts containing the summarization marker, user message and format untouched, keyed requests never rewritten.

@@ -2,19 +2,22 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
   createProvider,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  normalizeContext,
   type Api, type FetchFunction, type Model, type Provider, type StreamOptions,
 } from "@earendil-works/pi-ai";
 import { getApiProvider, registerApiProvider } from "@earendil-works/pi-ai/compat";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
-import { opencodeProvider } from "@earendil-works/pi-ai/providers/opencode";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 
 export const PROVIDER_ID = "opencode-zen-free";
 export const BASE_URL = "https://opencode.ai/zen/v1";
 const SUPPORTED_APIS = new Set(["openai-responses", "openai-completions"]);
 
 export function freeModels(): Model<Api>[] {
-  return opencodeProvider().getModels()
+  return getBuiltinModels("opencode")
     .filter((m) => SUPPORTED_APIS.has(m.api) && Object.values(m.cost).every((cost) => cost === 0))
     .map((m) => ({
       ...m,
@@ -34,7 +37,7 @@ export function freeModels(): Model<Api>[] {
     }));
 }
 
-export const OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14 pi-opencode-direct/0.1.6";
+export const OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14 pi-opencode-direct/0.1.7";
 export const OPENCODE_CLIENT = "cli";
 export const OPENCODE_PROJECT = "global";
 
@@ -182,25 +185,52 @@ export const OPENCODE_SUMMARIZATION_PROMPT =
   "Always follow the exact output structure requested by the user prompt. Keep every section, preserve exact file paths and identifiers when known, and prefer terse bullets over paragraphs.\n" +
   "Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.\n";
 
-/** Marker identifying Pi's own compaction system prompt (0.85.1 wording). */
+/** Marker identifying Pi's own compaction system prompt (0.85.1 wording, still current in 0.86). */
 const PI_SUMMARIZATION_MARKER = "context summarization";
 
 /**
  * Swap Pi's compaction system prompt for OpenCode's byte-identical one when
- * sending anonymously to Zen. The user message (which carries Pi's output
- * format) is untouched, so Pi still gets the structure it expects. Only
- * applies to short standalone prompts containing the marker — never to
- * conversation-bearing content — and never when a real API key is in use.
- * Returns the context unchanged when no swap applies.
+ * sending anonymously to Zen. Handles both shapes:
+ * - Legacy `Context` (`{ systemPrompt }`, pre-0.86 callers and unit tests).
+ * - Normalized `TranscriptContext` (`{ messages }`, Pi 0.86+): the prompt
+ *   lives in the leading system message(s); read it with
+ *   `getCurrentSystemPrompt()` per the 0.86 Custom Streaming API contract.
+ * The user message (which carries Pi's output format) is untouched, so Pi
+ * still gets the structure it expects. Only applies to short standalone
+ * prompts containing the marker — never to conversation-bearing content
+ * (more than one non-system message, or any declared tools) — and never
+ * when a real API key is in use. Returns the context unchanged when no swap
+ * applies.
  */
 export function swapCompactionPrompt<T>(context: T, apiKey: unknown): T {
   const key = typeof apiKey === "string" && apiKey.trim() ? apiKey : "public";
   if (key !== "public") return context;
   if (!context || typeof context !== "object") return context;
+  // Legacy Context shape.
   const sys = (context as { systemPrompt?: unknown }).systemPrompt;
-  if (typeof sys !== "string") return context;
-  if (sys.length > 2000 || !sys.toLowerCase().includes(PI_SUMMARIZATION_MARKER)) return context;
-  return { ...(context as Record<string, unknown>), systemPrompt: OPENCODE_SUMMARIZATION_PROMPT } as T;
+  if (typeof sys === "string") {
+    if (sys.length > 2000 || !sys.toLowerCase().includes(PI_SUMMARIZATION_MARKER)) return context;
+    return { ...(context as Record<string, unknown>), systemPrompt: OPENCODE_SUMMARIZATION_PROMPT } as T;
+  }
+  // Normalized TranscriptContext shape (Pi 0.86+): prompt lives in system messages.
+  const msgs = (context as { messages?: unknown }).messages;
+  if (!Array.isArray(msgs)) return context;
+  try {
+    const prompt = getCurrentSystemPrompt(msgs as Parameters<typeof getCurrentSystemPrompt>[0]);
+    if (!prompt || prompt.length > 2000 || !prompt.toLowerCase().includes(PI_SUMMARIZATION_MARKER)) return context;
+    const tools = getCurrentTools(msgs as Parameters<typeof getCurrentTools>[0]);
+    if (tools.length > 0) return context;
+    const nonSystem = (msgs as Array<{ role?: unknown }>).filter((m) => m?.role !== "system");
+    if (nonSystem.length !== 1 || (nonSystem[0] as { role?: unknown })?.role !== "user") return context;
+    const nextMsgs = (msgs as Record<string, unknown>[]).map((m) => {
+      if ((m as { role?: unknown })?.role !== "system") return m;
+      const { sections: _dropped, ...rest } = m;
+      return { ...rest, content: OPENCODE_SUMMARIZATION_PROMPT };
+    });
+    return { ...(context as Record<string, unknown>), messages: nextMsgs } as T;
+  } catch {
+    return context;
+  }
 }
 
 /** Env var for an optional Zen API key (account quota instead of anonymous). */
@@ -277,7 +307,7 @@ export function patchCompatDirectTransport(getSessionId: SessionGetter = () => u
       api: api as Parameters<typeof registerApiProvider>[0]["api"],
       stream: ((model: Model<Api>, context: never, options: StreamOptions) => {
         if ((model as Model<Api>).provider !== PROVIDER_ID) return origStream(model as never, context as never, options as never);
-        const ctx = swapCompactionPrompt(context, (options as { apiKey?: unknown } | undefined)?.apiKey);
+        const ctx = swapCompactionPrompt(ensureTranscript(context), (options as { apiKey?: unknown } | undefined)?.apiKey);
         const processed = compatRequestOptions(options, getSessionId, fallbackSession);
         debugLog(`${identitySummary(new Headers(processed.headers as HeadersInit | undefined), "compat")} ${shapeSummary(ctx, options)}`);
         return origStream(model as never, ctx as never, processed as never);
@@ -285,7 +315,7 @@ export function patchCompatDirectTransport(getSessionId: SessionGetter = () => u
       streamSimple: ((model: Model<Api>, context: never, options: StreamOptions) => {
         if ((model as Model<Api>).provider !== PROVIDER_ID) return origStreamSimple(model as never, context as never, options as never);
         // No reasoning default here (see doc comment): compat omission means off.
-        const ctx = swapCompactionPrompt(context, (options as { apiKey?: unknown } | undefined)?.apiKey);
+        const ctx = swapCompactionPrompt(ensureTranscript(context), (options as { apiKey?: unknown } | undefined)?.apiKey);
         const processed = compatRequestOptions(options, getSessionId, fallbackSession);
         debugLog(`${identitySummary(new Headers(processed.headers as HeadersInit | undefined), "compat")} ${shapeSummary(ctx, options)}`);
         return origStreamSimple(model as never, ctx as never, processed as never);
@@ -328,6 +358,21 @@ function identitySummary(headers: Headers, via: string): string {
   return `${via} ua=${ua.slice(0, 28)}... session=${session.slice(0, 12)}... auth=${auth.slice(0, 14)}... arid=${arid.slice(0, 12)}...`;
 }
 
+/** Normalize legacy `Context` (`{ systemPrompt/tools/messages }`) to the 0.86
+ * `TranscriptContext` Pi core hands providers. Already-normalized transcripts
+ * pass through untouched. Lets direct calls (unit tests, side-channels)
+ * keep working while Pi core always sends transcripts. */
+function ensureTranscript<T>(context: T): T {
+  if (!context || typeof context !== "object") return context;
+  const rec = context as Record<string, unknown>;
+  if (rec.systemPrompt === undefined && rec.tools === undefined) return context;
+  try {
+    return normalizeContext(context as unknown as Parameters<typeof normalizeContext>[0]) as T;
+  } catch {
+    return context;
+  }
+}
+
 /** Sizes and shape only — never content. */
 function shapeSummary(context: unknown, options: unknown): string {
   try {
@@ -341,7 +386,14 @@ function shapeSummary(context: unknown, options: unknown): string {
         if (chars > 10_000_000) break;
       }
     }
-    const tools = Array.isArray(ctx.tools) ? ctx.tools.length : 0;
+    let tools = Array.isArray(ctx.tools) ? ctx.tools.length : 0;
+    if (!Array.isArray(ctx.tools) && Array.isArray(ctx.messages)) {
+      try {
+        tools = getCurrentTools(ctx.messages as Parameters<typeof getCurrentTools>[0]).length;
+      } catch {
+        tools = 0;
+      }
+    }
     return `msgs=${Array.isArray(ctx.messages) ? ctx.messages.length : "?"} chars~${chars} tools=${tools} reasoning=${String(opt.reasoning ?? "(default)")}`;
   } catch {
     return "shape=(unavailable)";
@@ -621,7 +673,7 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       const signal = ctx.signal;
       const response = await fetch(`${BASE_URL}/models`, {
         signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
-        headers: { "User-Agent": "pi-opencode-direct/0.1.6" },
+        headers: { "User-Agent": "pi-opencode-direct/0.1.7" },
       });
       if (!response.ok) throw new Error(`Zen model catalogue: HTTP ${response.status}`);
       const body = await response.json() as { data?: { id?: unknown }[] };
@@ -634,11 +686,11 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       });
     },
     stream(model, context, options) {
-      const ctx = swapCompactionPrompt(context, (options as { apiKey?: unknown } | undefined)?.apiKey);
+      const ctx = swapCompactionPrompt(ensureTranscript(context), (options as { apiKey?: unknown } | undefined)?.apiKey);
       return provider.stream(model, ctx, requestOptions(options, ctx));
     },
     streamSimple(model, context, options) {
-      const ctx = swapCompactionPrompt(context, (options as { apiKey?: unknown } | undefined)?.apiKey);
+      const ctx = swapCompactionPrompt(ensureTranscript(context), (options as { apiKey?: unknown } | undefined)?.apiKey);
       return provider.streamSimple(model, ctx, {
         ...requestOptions(options, ctx),
         reasoning: options?.reasoning ?? (model.id.startsWith("muse-spark-") ? "xhigh" : undefined),

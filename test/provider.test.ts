@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createModels, Type, type Model, type Api, type FetchFunction } from "@earendil-works/pi-ai";
+import { createModels, normalizeContext, Type, type Api, type Context, type FetchFunction, type Model } from "@earendil-works/pi-ai";
 import { freeModels, zenProvider, PROVIDER_ID, sessionHeader, requestHeader, OPENCODE_USER_AGENT, STATIC_ZEN_HEADERS, isEncryptedContentError, stripStaleReasoning } from "../src/provider.ts";
 
 const muse = (p = zenProvider()) => p.getModels().find(m => m.id === "muse-spark-1.3-contributor-free")!;
-const context = { messages: [{ role: "user" as const, content: "Test", timestamp: 1 }] };
+/** Build a 0.86 TranscriptContext the way Pi core does before calling a Provider. */
+const toTranscript = (ctx: Context) => normalizeContext(ctx);
+const context = toTranscript({ messages: [{ role: "user" as const, content: "Test", timestamp: 1 }] });
 const usage = { input_tokens: 12, output_tokens: 8, total_tokens: 20, output_tokens_details: { reasoning_tokens: 3 } };
 const text = { id: "msg_1", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "Checking.", annotations: [] }] };
 const call = { id: "fc_1", type: "function_call", call_id: "call_1", name: "lookup", arguments: '{"key":"weather"}', status: "completed" };
@@ -53,10 +55,10 @@ test("live refresh intersects known free models and preserves catalogue on failu
 
 test("anonymous Responses requests preserve xhigh, images, and text-before-tool calls", async () => {
   const p = zenProvider(); const c = capture([thinking, text, call]);
-  const result = await p.streamSimple(muse(p), {
+  const result = await p.streamSimple(muse(p), toTranscript({
     messages: [{ role: "user", timestamp: 1, content: [{ type: "text", text: "Look" }, { type: "image", data: "AAAA", mimeType: "image/png" }] }],
     tools: [{ name: "lookup", description: "Look up a key", parameters: Type.Object({ key: Type.String() }) }],
-  }, { fetch: c.fetch, sessionId: "session-a", maxRetries: 0 }).result();
+  }), { fetch: c.fetch, sessionId: "session-a", maxRetries: 0 }).result();
   assert.equal(result.stopReason, "toolUse", result.errorMessage);
   assert.ok(result.content.some(b => b.type === "text" && b.text === "Checking."));
   assert.ok(result.content.some(b => b.type === "toolCall" && b.name === "lookup" && b.arguments.key === "weather"));
@@ -146,7 +148,7 @@ test("tool result replay keeps matching call IDs and reasoning signatures", asyn
   const assistant = await p.streamSimple(muse(p), context, { fetch: c.fetch }).result();
   const tool = assistant.content.find(b => b.type === "toolCall")!;
   const next = capture();
-  await p.streamSimple(muse(p), { messages: [...context.messages, assistant, { role: "toolResult", timestamp: 2, toolCallId: tool.id, toolName: tool.name, content: [{ type: "text", text: "Sunny" }], isError: false }] }, { fetch: next.fetch }).result();
+  await p.streamSimple(muse(p), toTranscript({ messages: [...context.messages, assistant, { role: "toolResult", timestamp: 2, toolCallId: tool.id, toolName: tool.name, content: [{ type: "text", text: "Sunny" }], isError: false }] }), { fetch: next.fetch }).result();
   const input = next.calls[0].body.input;
   assert.ok(input.some((m: any) => m.type === "reasoning" && m.encrypted_content === "opaque-signature"));
   const sentCall = input.find((m: any) => m.type === "function_call");
@@ -197,7 +199,7 @@ test("stripStaleReasoning drops reasoning and orphaned call ids", () => {
 test("Zen rotation retries once without replayed reasoning", async () => {
   const p = zenProvider();
   const model = muse(p);
-  const withHistory = {
+  const withHistory = toTranscript({
     messages: [
       ...context.messages,
       {
@@ -211,7 +213,7 @@ test("Zen rotation retries once without replayed reasoning", async () => {
         content: [{ type: "thinking" as const, thinking: "", thinkingSignature: JSON.stringify(thinking) }],
       },
     ],
-  };
+  });
   let secondCalls = 0;
   const bodies2: any[] = [];
   const fetch2: FetchFunction = async (_url, init) => {

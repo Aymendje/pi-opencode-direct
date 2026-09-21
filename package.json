@@ -1,6 +1,6 @@
 {
   "name": "pi-opencode-direct",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Keyless OpenCode Zen free models for Pi, using native HTTP APIs",
   "type": "module",
   "license": "MIT",
@@ -33,15 +33,15 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.85.1"
+    "@earendil-works/pi-ai": "0.86.1"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.85.1",
-    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@earendil-works/pi-ai": "0.86.1",
+    "@earendil-works/pi-coding-agent": "0.86.1",
     "@types/node": "^22.0.0",
     "typescript": "^5.9.0"
   },
