@@ -37,6 +37,56 @@ export function freeModels(): Model<Api>[] {
     }));
 }
 
+/** IDs que parecem free mas não são chat (classifier, etc). */
+const NON_CHAT_FREE_PREFIXES = ["jev-"];
+
+/** Verdadeiro para modelo free desconhecido no catálogo embutido. */
+export function isUnknownFreeId(id: unknown): boolean {
+  if (typeof id !== "string" || id.length === 0) return false;
+  if (NON_CHAT_FREE_PREFIXES.some((p) => id.startsWith(p))) return false;
+  return /(^|[\/:_-])free([\/:_-]|$)/i.test(id) || /-free$/i.test(id);
+}
+
+/** "step-5-preview-free" -> "Step 5 Preview Free". */
+export function prettyFreeName(id: string): string {
+  return (id.split("/").pop() as string)
+    .split(/[-_:]+/)
+    .map((w) => (/^[a-z]+$/i.test(w) ? w.charAt(0).toUpperCase() + w.slice(1) : w))
+    .join(" ");
+}
+
+/**
+ * Modelo sintético para free novo que Zen serve mas pi-ai embutido
+ * ainda não conhece. Defaults conservadores, transporte Chat Completions
+ * (mesmo dos outros free). Quando `pi update --models` trouxer metadado
+ * oficial, baseline cobre ID e sintético sai sozinho. Ajuste fino via
+ * `modelOverrides` em models.json.
+ */
+export function syntheticFreeModel(id: string): Model<Api> {
+  const isResponses = id.startsWith("muse-spark-");
+  const base = {
+    id,
+    name: prettyFreeName(id),
+    provider: PROVIDER_ID,
+    baseUrl: BASE_URL,
+    reasoning: true,
+    input: ["text", "image"] as ("text" | "image")[],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 262144,
+    maxTokens: 32768,
+    headers: { ...STATIC_ZEN_HEADERS },
+  };
+  if (isResponses) {
+    return { ...base, api: "openai-responses", compat: { sessionAffinityFormat: "openai-nosession" } } as unknown as Model<Api>;
+  }
+  return {
+    ...base,
+    api: "openai-completions",
+    compat: { supportsStore: false, supportsDeveloperRole: false, supportsStrictMode: true, maxTokensField: "max_tokens" },
+    inputLimits: { images: { resize: { maxWidth: 2000, maxHeight: 2000, maxBytes: 4718592, jpegQuality: 80 } } },
+  } as unknown as Model<Api>;
+}
+
 export const OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14 pi-opencode-direct/0.1.7";
 export const OPENCODE_CLIENT = "cli";
 export const OPENCODE_PROJECT = "global";
@@ -664,9 +714,22 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
     ...provider,
     getModels: () => catalogue,
     async refreshModels(ctx) {
+      const baselineById = new Map(baseline.map((m) => [m.id, m]));
       const select = (ids: Set<unknown>) => baseline.filter((m) => ids.has(m.id));
+      const reattach = (m: Model<Api>): Model<Api> => ({
+        ...m,
+        provider: PROVIDER_ID,
+        baseUrl: BASE_URL,
+        headers: { ...(m.headers ?? {}), ...STATIC_ZEN_HEADERS },
+      });
       if (ctx.stored) {
-        const restored = select(new Set(ctx.stored.models.map((m) => m.id)));
+        const storedIds = new Set(ctx.stored.models.map((m) => m.id));
+        const restored = [
+          ...select(storedIds),
+          ...ctx.stored.models
+            .filter((m) => !baselineById.has(m.id) && isUnknownFreeId(m.id))
+            .map(reattach),
+        ];
         if (!await ctx.publish({ update: () => { catalogue = restored; } })) return;
       }
       if (!ctx.allowNetwork || ctx.signal.aborted) return;
@@ -679,7 +742,10 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       const body = await response.json() as { data?: { id?: unknown }[] };
       if (!Array.isArray(body.data)) throw new Error("Invalid Zen model catalogue");
       const available = new Set(body.data.map((m) => m.id));
-      const next = select(available);
+      const unknownIds = [...available]
+        .filter((id): id is string => typeof id === "string" && !baselineById.has(id) && isUnknownFreeId(id))
+        .sort();
+      const next = [...select(available), ...unknownIds.map(syntheticFreeModel)];
       await ctx.publish({
         persist: { models: next, checkedAt: Date.now() },
         update: () => { catalogue = next; },
