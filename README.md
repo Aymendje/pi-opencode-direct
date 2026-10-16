@@ -5,7 +5,7 @@ installation, login, API key, server, container, or LiteLLM is required.
 
 ## Install
 
-Requires Pi 0.85.1 or newer (tested with 0.85.1) and Node 22.19 or newer.
+Requires Pi 0.85.1 or newer (tested with 1.3.0) and Node 22.19 or newer.
 
 ```sh
 pi install npm:pi-opencode-direct
@@ -56,7 +56,9 @@ it for everyone behind that IP with `FreeTierError`, while the genuine CLI from
 a fresh IP keeps working. If anonymous fails everywhere at once, wait for the
 window to reset and move heavy background work to a keyed model; light chat
 spends little. Set `PI_OPENCODE_DIRECT_DEBUG=1` to log outbound identity.
-A hash of Pi's session ID supplies `x-opencode-session`, keeping
+A generated OpenCode session id (timestamp-based `ses_` id, cached per Pi
+session) supplies `x-opencode-session` and the full correlation set
+(`x-opencode-session-id` / `x-session-affinity` / `X-Session-Id`), keeping
 routing affinity stable across turns and distinct between sessions. Auxiliary
 calls use the active Pi session when no explicit session ID is available.
 
@@ -77,13 +79,13 @@ Background-review direct transport (`pi-ai/compat completeSimple`) bypasses
 the `stream()` wrapper, so this extension patches the global compat registry
 at load: `opencode-zen-free` models get the full dynamic identity there too
 (`Bearer public`, OpenCode `User-Agent` / `x-opencode-client` / `project` /
-per-session `x-opencode-session` / per-request `x-opencode-request`, plus the
+per-session correlation headers, plus the
 encrypted-content retry), while other providers pass through untouched. No
 memory config needed for the default direct transport — and compat omission
 stays `off`, preserving Hermes `llmThinkingOverride: off` (no forced `xhigh`
 on this path).
 
-As a last resort, a fetch guard scoped strictly to `https://opencode.ai/zen/v1`
+As a last resort, a fetch guard scoped strictly to `https://opencode.ai/inference/v1`
 adds the same identity at the network edge for any other in-process path
 (Pi core flows such as compaction, present or future) — other hosts pass
 through untouched, and a valid upstream session / existing Authorization are
@@ -120,7 +122,7 @@ npm run test:live
 xhigh reasoning, native streaming tool calls, and replay of a tool result.
 Use the free tier lightly and follow the provider's data-use policies.
 
-Validated with Pi 0.85.1: seven automated tests; live image recognition with a
+Validated with Pi 1.3.0 and OpenCode CLI 2.0.30: twenty-one automated tests; live chat with a
 native tool-call/result round trip; and a Pi CLI session that used `read` on a
 PNG and correctly described it while OpenCode was absent from `PATH`.
 

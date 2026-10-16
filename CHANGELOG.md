@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.8
+
+- Recover from the upstream free-tier gate change (OpenCode 2.x): the inference
+  endpoint moved from `https://opencode.ai/zen/v1` to
+  `https://opencode.ai/inference/v1`, the `User-Agent` is now
+  `opencode/latest/2.0.30/cli`, and requests carry the full CLI correlation
+  set (`x-opencode-session-id` / `x-session-affinity` / `X-Session-Id` alongside
+  `x-opencode-session`). Session ids are now generated timestamp-based
+  (`descending()` in `packages/schema/src/identifier.ts`) and cached per Pi
+  session: the gate validates that the id prefix decodes to a plausible recent
+  timestamp, so hash-derived ids were rejected with `FreeTierError` even with
+  otherwise identical requests (found by replaying a captured CLI request).
+  `x-opencode-request` and explicit `x-client-request-id` are no longer sent
+  (the CLI sends neither; extra headers are ignored server-side).
+  All guards re-scoped to `/inference/v1`.
+
 ## 0.1.7
 
 - Pi 0.86.1 compatibility: adapt to the `TranscriptContext` Custom Streaming API. All `stream`/`streamSimple` paths (provider wrapper and compat side-channel patch) normalize legacy `Context` (`systemPrompt`/`tools`) to transcripts via `normalizeContext`, so direct calls keep working while Pi core sends transcripts. `swapCompactionPrompt` handles both shapes — legacy `systemPrompt` and transcript system messages read via `getCurrentSystemPrompt` (tools checked via `getCurrentTools`) — still limited to short standalone summarization prompts, user message and format untouched, keyed requests never rewritten. Debug shape summaries count transcript-declared tools.
