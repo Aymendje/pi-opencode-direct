@@ -40,16 +40,21 @@ test("free catalogue uses Pi capabilities and excludes paid models", () => {
   assert.equal(muse().thinkingLevelMap?.xhigh, "xhigh");
 });
 
-test("live refresh intersects known free models and preserves catalogue on failure", async () => {
+test("live refresh intersects known free models, auto-registers unknown free, and preserves catalogue on failure", async () => {
   const p = zenProvider(); const models = createModels(); models.setProvider(p);
   const original = globalThis.fetch;
   try {
-    globalThis.fetch = async () => Response.json({ data: [{ id: muse().id }, { id: "gpt-6-astra" }, { id: "unknown-free" }] });
+    globalThis.fetch = async () => Response.json({ data: [{ id: muse().id }, { id: "gpt-6-astra" }, { id: "unknown-free" }, { id: "jev-1.13-free" }] });
     assert.equal((await models.refresh()).errors.size, 0);
-    assert.deepEqual(p.getModels().map(m => m.id), [muse().id]);
+    // Paid gpt-6-astra stays excluded, non-chat jev-*-free stays excluded,
+    // unknown free-looking IDs become synthetic entries (PR #7).
+    assert.deepEqual(p.getModels().map(m => m.id), [muse().id, "unknown-free"]);
+    const synthetic = p.getModels().find(m => m.id === "unknown-free")!;
+    assert.equal(synthetic.provider, PROVIDER_ID);
+    assert.ok(Object.values(synthetic.cost).every(v => v === 0));
     globalThis.fetch = async () => { throw new Error("offline"); };
     assert.equal((await models.refresh()).errors.size, 1);
-    assert.deepEqual(p.getModels().map(m => m.id), [muse().id]);
+    assert.deepEqual(p.getModels().map(m => m.id), [muse().id, "unknown-free"]);
   } finally { globalThis.fetch = original; }
 });
 
