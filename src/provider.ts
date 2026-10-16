@@ -1,19 +1,20 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
   createProvider,
+  getApiProvider,
   getCurrentSystemPrompt,
   getCurrentTools,
   normalizeContext,
+  openAICompletionsApi,
+  openAIResponsesApi,
+  registerApiProvider,
   type Api, type FetchFunction, type Model, type Provider, type StreamOptions,
-} from "@earendil-works/pi-ai";
-import { getApiProvider, registerApiProvider } from "@earendil-works/pi-ai/compat";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
-import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+} from "@earendil-works/pi-ai/compat";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 
 export const PROVIDER_ID = "opencode-zen-free";
-export const BASE_URL = "https://opencode.ai/zen/v1";
+export const BASE_URL = "https://opencode.ai/inference/v1";
 const SUPPORTED_APIS = new Set(["openai-responses", "openai-completions"]);
 
 export function freeModels(): Model<Api>[] {
@@ -27,8 +28,8 @@ export function freeModels(): Model<Api>[] {
       // (e.g. pi-hermes-memory direct transport via pi-ai/compat completeSimple,
       // which resolves auth + model.headers but never calls our requestOptions
       // wrapper) still look like OpenCode. Dynamic per-request headers
-      // (x-opencode-session / x-opencode-request / Authorization) are added in
-      // requestOptions() for the main path; compat createClient merges
+      // (x-opencode-session / session-id / affinity / Authorization) are added
+      // in requestOptions() for the main path; compat createClient merges
       // model.headers then options headers, so these survive both paths.
       headers: {
         ...m.headers,
@@ -87,7 +88,7 @@ export function syntheticFreeModel(id: string): Model<Api> {
   } as unknown as Model<Api>;
 }
 
-export const OPENCODE_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14 pi-opencode-direct/0.1.7";
+export const OPENCODE_USER_AGENT = "opencode/latest/2.0.30/cli";
 export const OPENCODE_CLIENT = "cli";
 export const OPENCODE_PROJECT = "global";
 
@@ -114,21 +115,48 @@ function base62FromBytes(bytes: Uint8Array, length: number): string {
 
 /**
  * Map a Pi session id to a valid OpenCode session id.
- * Format from packages/opencode/src/id/id.ts: `ses_` + 12 hex chars
- * (6 timestamp bytes) + 14 random base62 chars. The upstream free-tier gate
- * rejects structurally invalid ids (e.g. 64-char sha256 hex or 24-char
- * base62 without a hex prefix), while freshly generated valid ids pass.
- * Hashing keeps affinity stable per Pi session and distinct between sessions.
+ * Format from packages/schema/src/identifier.ts (`descending()`): `ses_` +
+ * 12 hex chars (6 timestamp bytes, bitwise-NOT of `timestamp_ms * 0x1000 +
+ * counter`) + 14 random base62 chars. The upstream free-tier gate validates
+ * that the hex prefix decodes to a plausible recent timestamp: hash-derived
+ * prefixes (random timestamps) are rejected with FreeTierError while
+ * freshly generated timestamp-based ids pass, even anonymously.
+ * Generated ids are cached per Pi session id so routing affinity stays
+ * stable across turns and distinct between sessions within this process.
  */
-export function sessionHeader(sessionId: string): string {
-  const hash = createHash("sha256").update(`${PROVIDER_ID}:${sessionId}`).digest();
-  const hex = hash.subarray(0, 6).toString("hex");
-  return `ses_${hex}${base62FromBytes(hash.subarray(6), 14)}`;
+const sessionHeaderCache = new Map<string, string>();
+let sessionHeaderCounter = 0;
+let sessionHeaderLastTimestamp = 0;
+
+function createDescendingSessionId(): string {
+  const timestamp = Date.now();
+  if (timestamp !== sessionHeaderLastTimestamp) {
+    sessionHeaderLastTimestamp = timestamp;
+    sessionHeaderCounter = 0;
+  }
+  sessionHeaderCounter++;
+  // Match `descending()`: value = ~(timestamp * 0x1000 + counter), then the
+  // low 6 bytes as hex. BigInt `~x === -x - 1n`; `& 0xff` per byte equals
+  // value mod 2**48 rendered big-endian.
+  const current = BigInt(timestamp) * 0x1000n + BigInt(sessionHeaderCounter);
+  const mod = ((-current - 1n) % (1n << 48n) + (1n << 48n)) % (1n << 48n);
+  const hex = mod.toString(16).padStart(12, "0");
+  return `ses_${hex}${base62FromBytes(randomBytes(14), 14)}`;
 }
 
-/** Random valid OpenCode request id (`msg_` + 12 hex + 14 base62). Not validated, but matches the real CLI. */
-export function requestHeader(): string {
-  return `msg_${randomBytes(6).toString("hex")}${base62FromBytes(randomBytes(14), 14)}`;
+export function sessionHeader(sessionId: string): string {
+  const cached = sessionHeaderCache.get(sessionId);
+  if (cached) return cached;
+  const created = createDescendingSessionId();
+  sessionHeaderCache.set(sessionId, created);
+  return created;
+}
+
+/** Test hook: clear the per-session cache (unit tests only). */
+export function __clearSessionHeaderCacheForTests(): void {
+  sessionHeaderCache.clear();
+  sessionHeaderCounter = 0;
+  sessionHeaderLastTimestamp = 0;
 }
 
 /**
@@ -309,7 +337,7 @@ export async function resolveZenApiKey(input: {
 
 function compatRequestOptions<T extends StreamOptions>(options: T, getSessionId: SessionGetter, fallbackSession: string): T {
   const headers = Object.fromEntries(Object.entries(options?.headers ?? {})
-    .filter(([name]) => !["authorization", "user-agent", "x-opencode-session", "x-opencode-client", "x-opencode-project", "x-opencode-request"].includes(name.toLowerCase())));
+    .filter(([name]) => !["authorization", "user-agent", "x-opencode-session", "x-opencode-session-id", "x-session-affinity", "x-session-id", "x-opencode-client", "x-opencode-project", "x-opencode-request", "x-client-request-id"].includes(name.toLowerCase())));
   const opencodeSession = sessionHeader(options?.sessionId ?? getSessionId() ?? fallbackSession);
   // An explicitly resolved key (stored credential, env, or --api-key) is
   // honored; otherwise anonymous. Authorization is rebuilt from the effective
@@ -319,11 +347,11 @@ function compatRequestOptions<T extends StreamOptions>(options: T, getSessionId:
   return {
     ...options,
     apiKey: effectiveApiKey,
-    // Pi core compaction forces cacheRetention "none", for which pi-ai drops
-    // its own session-affinity headers (x-client-request-id) downstream — yet
-    // Zen 403s requests missing it while identical ones carrying it pass.
-    // Set it explicitly here (options headers merge last) so the drop cannot
-    // remove it. Same affinity value as x-opencode-session.
+    // Session correlation headers, byte-identical to the real OpenCode CLI
+    // (packages/core/src/session/model-request.ts): the free-tier gate
+    // validates that the session id carries a plausible recent timestamp,
+    // and requires the full set. `x-opencode-request` (msg_*) and
+    // `x-client-request-id` are not sent by the CLI, so they are dropped.
     sessionId: opencodeSession,
     timeoutMs: options?.timeoutMs ?? 180_000,
     maxRetries: options?.maxRetries ?? 2,
@@ -331,11 +359,12 @@ function compatRequestOptions<T extends StreamOptions>(options: T, getSessionId:
     headers: {
       ...headers,
       Authorization: `Bearer ${effectiveApiKey}`,
-      "x-client-request-id": opencodeSession,
+      "x-opencode-session-id": opencodeSession,
+      "x-session-affinity": opencodeSession,
+      "X-Session-Id": opencodeSession,
       "x-opencode-session": opencodeSession,
       "x-opencode-client": OPENCODE_CLIENT,
       "x-opencode-project": OPENCODE_PROJECT,
-      "x-opencode-request": requestHeader(),
       "User-Agent": OPENCODE_USER_AGENT,
     },
   };
@@ -404,8 +433,8 @@ function identitySummary(headers: Headers, via: string): string {
   const ua = headers.get("User-Agent") ?? "(missing)";
   const session = headers.get("x-opencode-session") ?? "(missing)";
   const auth = headers.get("authorization") ?? "(missing)";
-  const arid = headers.get("x-client-request-id") ?? "(missing)";
-  return `${via} ua=${ua.slice(0, 28)}... session=${session.slice(0, 12)}... auth=${auth.slice(0, 14)}... arid=${arid.slice(0, 12)}...`;
+  const sid = headers.get("x-opencode-session-id") ?? "(missing)";
+  return `${via} ua=${ua.slice(0, 28)}... session=${session.slice(0, 12)}... auth=${auth.slice(0, 14)}... sid=${sid.slice(0, 12)}...`;
 }
 
 /** Normalize legacy `Context` (`{ systemPrompt/tools/messages }`) to the 0.86
@@ -488,18 +517,19 @@ export function patchGlobalFetchForZen(getSessionId: SessionGetter = () => undef
       const rawInit = (init ?? {}) as Record<string, unknown>;
       const headers = new Headers(rawInit.headers as HeadersInit | undefined);
       const existingSession = headers.get("x-opencode-session");
-      headers.set(
-        "x-opencode-session",
-        existingSession && ZEN_SESSION_PATTERN.test(existingSession)
-          ? existingSession
-          : sessionHeader(getSessionId() ?? randomUUID()),
-      );
+      const session = existingSession && ZEN_SESSION_PATTERN.test(existingSession)
+        ? existingSession
+        : sessionHeader(getSessionId() ?? randomUUID());
+      headers.set("x-opencode-session", session);
+      headers.set("x-opencode-session-id", headers.get("x-opencode-session-id") && ZEN_SESSION_PATTERN.test(headers.get("x-opencode-session-id")!) ? headers.get("x-opencode-session-id")! : session);
+      headers.set("x-session-affinity", headers.get("x-session-affinity") && ZEN_SESSION_PATTERN.test(headers.get("x-session-affinity")!) ? headers.get("x-session-affinity")! : session);
+      headers.set("X-Session-Id", headers.get("X-Session-Id") && ZEN_SESSION_PATTERN.test(headers.get("X-Session-Id")!) ? headers.get("X-Session-Id")! : session);
       if (!headers.get("authorization")) headers.set("Authorization", "Bearer public");
       headers.set("User-Agent", OPENCODE_USER_AGENT);
       headers.set("x-opencode-client", OPENCODE_CLIENT);
       headers.set("x-opencode-project", OPENCODE_PROJECT);
-      if (!headers.get("x-opencode-request")) headers.set("x-opencode-request", requestHeader());
-      if (!headers.get("x-client-request-id")) headers.set("x-client-request-id", headers.get("x-opencode-session") ?? sessionHeader(getSessionId() ?? randomUUID()));
+      headers.delete("x-opencode-request");
+      headers.delete("x-client-request-id");
       debugLog(identitySummary(headers, "fetch"));
       const startedAt = Date.now();
       try {
@@ -572,16 +602,37 @@ export function applyZenHeadersToNodeHeaders(headers: NodeHeadersInit, getSessio
     }
     (out as Record<string, string>)[name] = value;
   };
+  const del = (name: string): void => {
+    if (!out) return;
+    if (out instanceof Headers) {
+      out.delete(name);
+      return;
+    }
+    if (Array.isArray(out)) {
+      const lower = name.toLowerCase();
+      out = out.filter((pair) => pair?.[0]?.toLowerCase() !== lower);
+      return;
+    }
+    const lower = name.toLowerCase();
+    for (const key of Object.keys(out)) {
+      if (key.toLowerCase() === lower) delete (out as Record<string, unknown>)[key];
+    }
+  };
   const session = readNodeHeader(out, "x-opencode-session");
-  set("x-opencode-session", session && ZEN_SESSION_PATTERN.test(session) ? session : sessionHeader(getSessionId() ?? randomUUID()));
+  const resolved = session && ZEN_SESSION_PATTERN.test(session) ? session : sessionHeader(getSessionId() ?? randomUUID());
+  set("x-opencode-session", resolved);
+  const sid = readNodeHeader(out, "x-opencode-session-id");
+  set("x-opencode-session-id", sid && ZEN_SESSION_PATTERN.test(sid) ? sid : resolved);
+  const affinity = readNodeHeader(out, "x-session-affinity");
+  set("x-session-affinity", affinity && ZEN_SESSION_PATTERN.test(affinity) ? affinity : resolved);
+  const xSid = readNodeHeader(out, "x-session-id");
+  set("X-Session-Id", xSid && ZEN_SESSION_PATTERN.test(xSid) ? xSid : resolved);
   if (!readNodeHeader(out, "authorization")) set("Authorization", "Bearer public");
   set("User-Agent", OPENCODE_USER_AGENT);
   set("x-opencode-client", OPENCODE_CLIENT);
   set("x-opencode-project", OPENCODE_PROJECT);
-  if (!readNodeHeader(out, "x-opencode-request")) set("x-opencode-request", requestHeader());
-  if (!readNodeHeader(out, "x-client-request-id")) {
-    set("x-client-request-id", readNodeHeader(out, "x-opencode-session") ?? sessionHeader(getSessionId() ?? randomUUID()));
-  }
+  del("x-opencode-request");
+  del("x-client-request-id");
   return out;
 }
 
@@ -606,7 +657,7 @@ function splitHttpArgs(args: unknown[]): { options: Record<string, unknown>; cal
 
 export function isZenNodeRequestOptions(options: Record<string, unknown>): boolean {
   const host = String(options.hostname ?? options.host ?? "").split(":")[0]?.toLowerCase();
-  return host === "opencode.ai" && String(options.path ?? "/").startsWith("/zen/v1");
+  return host === "opencode.ai" && String(options.path ?? "/").startsWith("/inference/v1");
 }
 
 /**
@@ -736,7 +787,7 @@ export function zenProvider(getSessionId: () => string | undefined = () => undef
       const signal = ctx.signal;
       const response = await fetch(`${BASE_URL}/models`, {
         signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
-        headers: { "User-Agent": "pi-opencode-direct/0.1.7" },
+        headers: { "User-Agent": OPENCODE_USER_AGENT },
       });
       if (!response.ok) throw new Error(`Zen model catalogue: HTTP ${response.status}`);
       const body = await response.json() as { data?: { id?: unknown }[] };
