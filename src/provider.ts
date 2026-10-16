@@ -2,14 +2,15 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
   createProvider,
+  getApiProvider,
   getCurrentSystemPrompt,
   getCurrentTools,
   normalizeContext,
+  openAICompletionsApi,
+  openAIResponsesApi,
+  registerApiProvider,
   type Api, type FetchFunction, type Model, type Provider, type StreamOptions,
-} from "@earendil-works/pi-ai";
-import { getApiProvider, registerApiProvider } from "@earendil-works/pi-ai/compat";
-import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
-import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
+} from "@earendil-works/pi-ai/compat";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 
 export const PROVIDER_ID = "opencode-zen-free";
