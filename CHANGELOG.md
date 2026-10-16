@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.9
+
+- Auto-register unknown free Zen models (e.g. `step-5-preview-free`):
+  `refreshModels()` synthesizes conservative entries for free-looking IDs
+  served by Zen but missing from the bundled `pi-ai` catalogue (Chat
+  Completions transport, Responses variant for future `muse-spark-*` IDs),
+  and the stored-model restore path reattaches them instead of dropping
+  them. Paid IDs and non-chat `jev-*` classifiers stay excluded. Official
+  metadata from `pi update --models` replaces synthetics automatically;
+  fine-tuning stays possible via `modelOverrides` in `models.json`.
+- Note: models Zen's live catalogue is not currently serving (rotation gaps
+  such as `step-5-preview-free` or `nemotron-3-ultra-free`) cannot be
+  auto-registered — force-show them via
+  `providers["opencode-zen-free"].models` in `models.json` (official
+  metadata on `pi.dev/models`). Unlike `opencode models` (Models.dev
+  snapshot), the picker reflects what Zen serves right now.
+
 ## 0.1.8
 
 - Recover from the upstream free-tier gate change (OpenCode 2.x): the inference

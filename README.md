@@ -63,7 +63,9 @@ routing affinity stable across turns and distinct between sessions. Auxiliary
 calls use the active Pi session when no explicit session ID is available.
 
 A bounded public-catalogue refresh intersects the currently listed IDs with
-Pi's known zero-cost models. Unknown models and paid models are not registered.
+Pi's known zero-cost models. Paid models are not registered; unknown
+free-looking IDs get conservative synthetic entries (Chat Completions
+transport) until official metadata arrives via `pi update --models`.
 Pi's model cache is used offline, with the bundled catalogue as the initial
 fallback. Update Pi for newly added model metadata. Free-model availability
 and limits can change upstream; there is no automatic paid fallback.
