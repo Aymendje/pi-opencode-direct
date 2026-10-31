@@ -75,6 +75,21 @@ Requests use Pi's native retry handling (two retries by default) and a
 Muse Spark currently accepts only `tool_choice: auto`; normal Pi tool use does
 not require forced tool choice.
 
+### OpenCode Go subscription meter (gentle-shell)
+
+The extension registers a `gentle-pi:usage-source/v1` source for the
+`opencode-go` provider, so gentle-shell's `/gentle:usage` panel and status bar
+show the paid Go subscription windows (rolling 5h / weekly / monthly percent
+used + reset countdowns) exactly like its built-in Codex/Claude meters. The
+data comes from the official endpoint `GET https://opencode.ai/zen/go/v1/usage`
+(Bearer API key); percentages and countdowns only, no dollar figures. The
+shell supplies the stored provider credential per refresh; `OPENCODE_GO_API_KEY`
+(`OPENCODE_API_KEY`, `OPENCODE_ZEN_API_KEY` as fallbacks) is used when it does
+not. Scope is `opencode-go` only: keys without a Go subscription answer 403,
+which is reported as a failed refresh (keeping the last good snapshot), never
+as a confident zero. Registration re-emits on every `session_start`, so it is
+independent of extension load order.
+
 ## Memory extensions (pi-hermes-memory)
 
 Background-review direct transport (`pi-ai/compat completeSimple`) bypasses
